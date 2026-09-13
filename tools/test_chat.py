@@ -180,6 +180,17 @@ def _sse(text: str) -> bytes:
                                   ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
+def cut_inside(text: str) -> bytes:
+    """把一条完整的 SSE 行砍在 text 第一个字的中间（只留它的头一个字节）。
+
+    模拟网络分块 / 服务端断流正好切在多字节字符中间 —— 中文流里这是常态，
+    不是边角（UTF-8 一个汉字 3 字节，随机切点落在字中间的概率约 2/3）。
+    """
+    raw = _sse(text)
+    i = raw.index(text.encode("utf-8")[:1])
+    return raw[:i + 1]
+
+
 def run_worker(worker, timeout_ms=8000, stop_after_ms=None, on_chunk=None):
     """跑一个 ChatWorker 等它结束，把三个信号收下来。
 
@@ -304,6 +315,39 @@ def main() -> int:
         # break 不能把已经吐出来的字弄丢 —— 这条是上一条的安全带
         ck("提前收尾之后回复还是完整的", got["done"], "".join(PIECES))
         ck("没报错", got["fail"], None)
+
+        print("流断在汉字中间：")
+        # 这一条是回归测试，守的是流结尾那句 `decoder.decode(b"", final=True)`。
+        # 增量解码器默认 errors="strict"，缓冲区里压着半个汉字时它**抛
+        # UnicodeDecodeError**（不是吐 U+FFFD）：异常穿过 run() 的兜底变成
+        # fail("出错了：UnicodeDecodeError")，而 _on_fail 会 _drop_pending() ——
+        # 屏幕上已经显示出来的半条回复被丢进垃圾桶，换成一句用户看不懂的英文错误。
+        # 触发条件只是「循环退出时解码器里压着半个字符」，中文流里很常见：
+        # 用户点一下「停止」就有大约三分之二的概率撞上。
+        real_post = CH.requests.post
+        try:
+            fake3 = _FakeResponse([_sse(p) for p in PIECES] + [cut_inside("断在这儿了")])
+            CH.requests.post = lambda *a, **k: fake3
+            got = run_worker(CH.ChatWorker("sk-test", [{"role": "user", "content": "x"}]))
+        finally:
+            CH.requests.post = real_post
+        ck("服务端断在汉字中间时，已经收到的字照样送达", got["done"], "".join(PIECES))
+        ck("服务端断在汉字中间时不报错", got["fail"], None)
+
+        # 同一件事的「停止」路径：最后一块正切在汉字中间，用户点了停止。
+        # 这条是上一条的来路 —— 前面的用例都看不见它，因为假接口是整块整块写的，
+        # 分块边界永远落在 \n\n 上。
+        real_post = CH.requests.post
+        try:
+            fake4 = _FakeResponse([_sse("在呢") + cut_inside("怎么啦喵"), b"\n\n"],
+                                 per_chunk_sleep=0.2)
+            CH.requests.post = lambda *a, **k: fake4
+            worker = CH.ChatWorker("sk-test", [{"role": "user", "content": "x"}])
+            got = run_worker(worker, on_chunk=worker.stop)
+        finally:
+            CH.requests.post = real_post
+        ck("点停止时解码器里压着半个字，也不报错", got["fail"], None)
+        ck("点停止时已经收到的字照样送达", got["done"], "在呢")
     finally:
         srv.shutdown()
 

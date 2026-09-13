@@ -185,15 +185,18 @@ class ChatWorker(QThread):
                 if done:
                     break
 
-            # 两道冲刷，顺序不能反：
-            # 1) 解码器里可能还压着半个汉字（流正好切在字中间），先把它冲出来 ——
-            #    不冲的话它连着后面那个换行都进不了缓冲，直接静默丢。
-            # 2) 缓冲里可能还压着最后一行 —— 服务端最后一行没补换行的话，那几个字
-            #    会被静默丢掉，正是「回复偶尔缺几个字」那种最难查的问题。补一个换行
-            #    把它冲出来；万一是半行截断的 JSON，parse_sse_lines 解不出来会跳过，安全。
-            buf, tail0, _ = parse_sse_lines(buf, decoder.decode(b"", final=True))
+            # 流读完了，缓冲里可能还压着最后一行 —— 服务端最后一行没补换行的话，
+            # 那几个字会被静默丢掉，正是「回复偶尔缺几个字」那种最难查的问题。
+            # 补一个换行把它冲出来；万一是半行截断的 JSON，parse_sse_lines 解不出来会跳过，是安全的。
+            #
+            # 别再顺手去冲解码器（`decoder.decode(b"", final=True)`）：增量解码器默认
+            # errors="strict"，缓冲区里压着半个汉字时它**抛 UnicodeDecodeError**，
+            # 异常会被 run() 的兜底变成 fail("出错了：UnicodeDecodeError")，
+            # 而 _on_fail 会 _drop_pending() —— 已经显示在屏幕上的半条回复就这么没了。
+            # 而且冲了也没用：能压住的只可能是一个不完整的字符（完整的在 decode()
+            # 那一步就出来了），它必然在一条被截断的 SSE 行里，解不出来照样跳过。
+            # 中文流里分块边界落在字中间的概率约 2/3，点「停止」都会撞上，别再加回来。
             _buf, tail, _ = parse_sse_lines(buf, "\n")
-            tail = tail0 + tail
             for piece in tail:
                 parts.append(piece)
                 self.chunk.emit(piece)
