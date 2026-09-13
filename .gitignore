@@ -1,0 +1,10 @@
+# API Key 存在这里，绝不能提交
+config.json
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 仅供目检的中间图，能由 tools/build_assets.py 重新生成
+assets/_*.png
