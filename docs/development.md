@@ -67,6 +67,11 @@ python tools/make_shortcut.py
 `config.json` 在 `.gitignore` 里 —— 里面有 Key，**绝不能进版本库**。`chat.json` 也一样，
 那里面是用户的全部对话；原子写留下的 `.tmp` 中间文件同样排掉了。
 
+**Key 换不了厂家**：`api_key` 这一项只认 DeepSeek 的 Key，填别家的没用。想换别的厂家或者
+别的模型得改代码 —— `taffy_pet/chat.py` 里的 `API_URL` 和模型名（`MODEL`），以及
+`taffy_pet/balance.py` 里那个余额接口地址。这三处现在都是写死的常量，没有做成配置项，
+其中余额那步还只有 DeepSeek 有这个接口（别家没有对应的服务，不是改个地址就能接上的）。
+
 ## 重新生成素材
 
 素材是从一张白底立绘离线生成的，原图不跟着仓库走（那是别人画的，得自己传进来）。
