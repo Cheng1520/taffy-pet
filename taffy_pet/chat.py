@@ -68,7 +68,7 @@ def build_messages(persona_text: str, history: list) -> list:
 def parse_sse_lines(buf: str, text: str):
     """把新到的文本拼进缓冲，切出完整的 SSE 行，抽里面的正文增量。
 
-    返回 (剩下的缓冲, 这一批的文本, 是否收到 [DONE])。
+    返回 (剩下的缓冲, 这一批的文本, 这一轮切没切出 [DONE]（跨轮要自己累积）)。
 
     最后那段不完整的行留在缓冲里等下一块 —— 这是整个函数存在的理由。
     """
@@ -88,10 +88,16 @@ def parse_sse_lines(buf: str, text: str):
             data = json.loads(payload)
         except json.JSONDecodeError:
             continue                       # 坏块，跳过就好，不值得为它中断整段回复
+        if not isinstance(data, dict):
+            continue                       # 顶层得是对象，数组之类的一样当脏块
         choices = data.get("choices") or []
         if not choices:
             continue                       # 最后那个带 usage 的块没有 choices
+        if not isinstance(choices[0], dict):
+            continue                       # choices[0] 该是对象，不是就跳过
         delta = choices[0].get("delta") or {}
+        if not isinstance(delta, dict):
+            continue                       # delta 该是对象，同上
         piece = delta.get("content")
         if piece:
             out.append(piece)              # 首块只有 role 没有 content，这里自然跳过

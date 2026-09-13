@@ -142,7 +142,6 @@ def test_chat_prompt() -> None:
 def test_load_persona() -> None:
     print("人设读取：")
     from taffy_pet import chat as CH
-    from pathlib import Path
     import tempfile
 
     with tempfile.TemporaryDirectory() as d:
@@ -231,6 +230,9 @@ def test_sse_parse() -> None:
         ("没有 choices", 'data: {"usage":{"total_tokens":9}}\n\n'),
         ("choices 是空表", 'data: {"choices":[]}\n\n'),
         ("坏 JSON", 'data: {不是 json\n\n'),
+        ("顶层是数组", 'data: [1,2,3]\n\n'),
+        ("choices[0] 不是对象", 'data: {"choices":["x"]}\n\n'),
+        ("delta 不是对象", 'data: {"choices":[{"delta":"x"}]}\n\n'),
         ("非 data 行", ': keep-alive\n\n'),
         ("空行", '\n\n'),
     ]:
