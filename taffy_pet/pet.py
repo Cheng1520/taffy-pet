@@ -137,6 +137,15 @@ class PetWindow(QWidget):
         if was_click:
             self.on_click()
 
+    def show_hint_if_first_run(self) -> None:
+        """透明窗口没有任何可见的边框，不提示的话没人知道能右键、能拖。"""
+        if self.cfg.get("hint_shown"):
+            return
+        self.toast.show_message("拖我可以换位置 · 右键点我打开菜单")
+        self.toast.anchor_above(self.frameGeometry())
+        self.cfg["hint_shown"] = True
+        cfgmod.save(self.cfg)
+
     def on_click(self) -> None:
         self.play_sound()
         self.animator.pounce()

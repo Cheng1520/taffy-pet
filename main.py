@@ -4,7 +4,7 @@
 """
 import sys
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QApplication
 
 from taffy_pet import config as cfgmod
@@ -20,6 +20,8 @@ def main() -> int:
     cfg = cfgmod.load()
     pet = PetWindow(cfg)
     pet.show()
+    # 等窗口真正摆好位置再弹提示，否则气泡会按还没定位的坐标算
+    QTimer.singleShot(600, pet.show_hint_if_first_run)
     return app.exec_()
 
 

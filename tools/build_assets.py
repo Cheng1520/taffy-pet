@@ -122,7 +122,7 @@ def _skin_hair(arr):
     return skin, skin | hair
 
 
-def build_blink(img: Image.Image, irises, guard=(1.65, 1.55)) -> Image.Image:
+def build_blink(img: Image.Image, irises, guard=(1.65, 1.75)) -> Image.Image:
     arr0 = np.asarray(img).astype(np.int32)
     H, W = arr0.shape[:2]
     skin, excluded = _skin_hair(arr0)
@@ -132,7 +132,11 @@ def build_blink(img: Image.Image, irises, guard=(1.65, 1.55)) -> Image.Image:
         x0, y0, x1, y1 = ir
         icx, icy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         iw, ih = x1 - x0 + 1, y1 - y0 + 1
-        ex, ey = iw * guard[0], ih * guard[1]   # 椭圆护栏，防止掩膜吃到头发
+        # 椭圆护栏，防止掩膜吃到头发。
+        # 纵向 1.75 是量出来的：1.55 时右眼上方留着原图上睫毛的残影（显示尺寸下
+        # 看得见一道深色痕），再往上扩到 1.95+ 就会啃掉刘海 —— 发丝轮廓是高对比的，
+        # 缺一块比多一道睫毛线更扎眼。1.75 刚好盖掉残影又不碰刘海。
+        ex, ey = iw * guard[0], ih * guard[1]
 
         bx0, by0 = max(0, int(icx - ex) - 6), max(0, int(icy - ey) - 6)
         bx1, by1 = min(W, int(icx + ex) + 6), min(H, int(icy + ey) + 6)
@@ -155,31 +159,50 @@ def build_blink(img: Image.Image, irises, guard=(1.65, 1.55)) -> Image.Image:
         ex0, ey0, ex1, ey1 = bbox
         ew, eh = ex1 - ex0, ey1 - ey0
 
-        # 1) inpaint 填平眼睛区域
+        # 1) 填平眼睛区域
         sub = out[by0:by0 + m.shape[0], bx0:bx0 + m.shape[1]]
-        bgr = sub[..., :3][..., ::-1].astype(np.uint8)
-        filled = cv2.inpaint(bgr, (m * 255).astype(np.uint8), 5, cv2.INPAINT_TELEA)
-        rgb = filled[..., ::-1].astype(np.float64)
-
-        # 先算闭眼线位置 —— 下面按它做镜像，所以要在填充前算出来。
-        y_base = ey0 + eh * LASH_Y_AT
-
-        # 掩膜上边界紧贴深色刘海，inpaint 会从刘海取色，在眼睛上方抹出一块灰。
-        # 试过「收紧护栏」（更糟：护栏把掩膜上缘切出硬边，灰块反而变大）和
-        # 「朝肤色基准拉回」（能淡掉，但要压平区域，等于退回平涂补丁的老错误）。
-        # 正解：闭眼线以上本来就该是干净的皮肤，而线以下 inpaint 出来正是干净皮肤
-        # —— 直接按闭眼线上下镜像过去，得到真实肤质，不必让 inpaint 去猜。
         hh, ww = m.shape
-        yy = np.arange(by0, by0 + hh)[:, None]
-        rows = np.broadcast_to(yy < y_base, m.shape)          # 闭眼线以上的像素
-        take = np.broadcast_to(np.clip((2 * y_base - yy).astype(int) - by0, 0, hh - 1),
-                               m.shape)
-        cols = np.broadcast_to(np.arange(ww), m.shape)
-        sel = rows & m[take, cols] & m                     # 镜像源也得是填充区
-        rgb = np.where(sel[..., None], rgb[take, cols], rgb)
+
+        # 逐行横向插值：只在同一行内、用被遮段左右两侧的像素做线性插值。
+        #
+        # 不用 cv2.inpaint 是因为它从上下左右各个方向取色，而眼睛上方紧贴着深色
+        # 刘海 —— 发色被带下来，在眼睛上方抹出一块灰。试过的其它三条路：
+        #   · 朝肤色基准拉回：能淡掉，但要压平区域，等于退回平涂补丁的老错误
+        #   · 收紧掩膜护栏：更糟，护栏把掩膜上缘切出硬边，灰块反而变大
+        #   · 按闭眼线上下镜像：左眼干净了，右眼那块灰仍在
+        # 横向插值从根上避开发色：同一行左右两侧是刚出掩膜的干净皮肤，永远不往上取。
+        rgb = sub[..., :3].astype(np.float64).copy()
+        for y in range(hh):
+            xs = np.nonzero(m[y])[0]
+            if xs.size == 0:
+                continue
+            # 掩膜在一行里可能是几段，逐段填
+            breaks = np.nonzero(np.diff(xs) > 1)[0]
+            for a, b in zip(np.r_[xs[0], xs[breaks + 1]], np.r_[xs[breaks], xs[-1]]):
+                left = rgb[y, a - 1] if a > 0 else None
+                right = rgb[y, b + 1] if b + 1 < ww else None
+                if left is None and right is None:
+                    continue
+                if left is None:
+                    left = right
+                if right is None:
+                    right = left
+                # 段内有 n = b-a+1 个像素，两端各留一格给左右取样点 -> 取 n 个内点
+                t = np.linspace(0.0, 1.0, b - a + 3)[1:-1, None]
+                rgb[y, a:b + 1] = left * (1 - t) + right * t
+
+        # 逐行独立插值会让相邻行接不上，留下横向条带。沿纵向补一道高斯。
+        # 必须用归一化卷积（只在掩膜内加权平均）——直接模糊的话，掩膜上缘会把
+        # 上面的刘海又吸进来，等于绕一圈回到原来的灰渍问题。
+        wm = m[..., None].astype(np.float64)
+        den = ndimage.gaussian_filter1d(wm, 3.0, axis=0)
+        num = ndimage.gaussian_filter1d(rgb * wm, 3.0, axis=0)
+        rgb = np.where(m[..., None], num / np.maximum(den, 1e-6), rgb)
 
         sub[..., :3] = np.clip(rgb, 0, 255)
         sub[m, 3] = 255.0
+
+        y_base = ey0 + eh * LASH_Y_AT
 
         # 2) 画睫毛弧。闭眼时上眼睑完全盖住虹膜，所以不能压扁原作眼睛
         #    （那样会把琥珀虹膜压成一条橙条），必须重画一道线。

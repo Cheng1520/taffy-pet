@@ -19,8 +19,9 @@ DEFAULTS = {
     "height": 380,          # 角色在屏幕上的高度（像素）
     "opacity": 1.0,
     "always_on_top": True,
-    "blink": False,         # 眨眼默认关，见 README「关于眨眼」
+    "blink": True,
     "speech": "关注塔菲喵关注塔菲谢谢喵",
+    "hint_shown": False,    # 首次运行提示过操作方式了吗
     "volume": 1.0,
     "pos": None,            # [x, y]，上次退出时的位置
 }
