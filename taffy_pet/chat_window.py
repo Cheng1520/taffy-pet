@@ -50,6 +50,18 @@ class ChatWindow(QWidget):
         self.pending_text = ""       # 这一轮已经吐出来的字，_on_chunk 往里攒
         self.history = chat_store.load()
 
+        # 退出程序时必须把线程收掉，而窗口未必收得到 closeEvent：右键点塔菲 →「退出」
+        # 走的是 PetWindow.quit() → QApplication.quit()，聊天窗从没 close() 过。
+        # 进程收尾时窗口会带着**还在跑**的子 QThread 一起析构，Qt 直接 abort
+        # （0xC0000409，实测过；那不是 Python 异常，main.py 的 sys.excepthook 接不住，
+        # pythonw 下用户只看到程序凭空消失）。
+        # 挂在 aboutToQuit 上是因为它是所有退出路径的必经之处；_stop_worker 自己有
+        # worker is None 的早退，被重复调到也没事。self 是 QObject，窗口销毁时这条
+        # 连接会被 Qt 自动断开，不会留下悬垂回调。
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._stop_worker)
+
         self.setWindowTitle("塔菲")
         self.setMinimumSize(320, 400)
         self._restore_geometry()
@@ -186,6 +198,9 @@ class ChatWindow(QWidget):
         self._append_notice(msg)
 
     def _drop_pending(self) -> None:
+        # 攒的增量也一起清掉 —— 不清的话它会留到下一轮 _start_reply 之前，
+        # 谁在这中间碰一下 self.pending_text 就会读到上一轮的残字。
+        self.pending_text = ""
         if self.pending is not None:
             outer = getattr(self.pending, "_outer", self.pending)
             self.msgs.removeWidget(outer)
@@ -212,10 +227,25 @@ class ChatWindow(QWidget):
         except TypeError:
             pass
         if not self.worker.wait(3000):
-            print("[chat] 线程没能及时收尾，强杀")
+            # stop() 只是置个标志位，要等下一块数据到了才退出循环；模型那边一停顿
+            # 超过 3 秒就会走到这儿，长回复里很常见。
+            print("[chat] 线程停在读上没收住，强杀")
             self.worker.terminate()
             self.worker.wait(500)
+            if self.worker.isRunning():
+                # 没杀干净就绝不能放手。线程还活着而引用丢了，窗口析构时 Qt 照样 abort
+                # （见 __init__ 里那段）。宁可把引用留着，等下一次收尾
+                # （关窗 / aboutToQuit）再试一次。
+                print("[chat] 强杀没成功，线程还活着，先留着引用不析构")
+                self._drop_pending()
+                return
         self.worker = None
+        # 半句气泡必须在这儿清掉，不能只靠 _on_fail 里那次。closeEvent（关窗）和
+        # clear_history（清空记录）都走这条路，两条路都会把控件删掉：
+        # 不把 self.pending 置 None，它就成了指向已删控件的悬垂引用，Task 6 一碰就崩；
+        # 而那个半句从没写进 chat.json，留在界面上的话下次开窗 _render_history 一跑
+        # 它就凭空消失 —— 界面和落盘对不上，比干脆清掉更让人困惑（和 _on_fail 一个道理）。
+        self._drop_pending()
 
     def closeEvent(self, e) -> None:
         self._stop_worker()
