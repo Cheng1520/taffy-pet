@@ -293,9 +293,12 @@ def case_close_mid_stream() -> None:
     # 所以放行服务端必须从另一个线程来 —— 不然要白等 3 秒、走到 terminate() 那条
     # 路上去，测到的就不是「正常收尾」了。
     threading.Timer(0.3, gate.set).start()
-    # 顺手记一笔 cfgmod.save 有没有在关窗时被调到。几何键存下去也读不回来（那是
-    # 已裁决的偏差，config.load() 会把不在 DEFAULTS 里的键丢掉），但「关窗时试图
-    # 保存」这件事本身该有人守着 —— 不然哪天 closeEvent 里那行被删了没人知道。
+    # 顺手记一笔 cfgmod.save 有没有在关窗时被调到。「关窗时试图保存」这件事本身该
+    # 有人守着 —— 不然哪天 closeEvent 里那行被删了没人知道。
+    # （Task 6 时这儿的说法是「几何存下去也读不回来，那是已裁决的偏差」：当时
+    # config.load() 会把不在 DEFAULTS 里的键丢掉，几何确实记不住。Task 7 把
+    # chat_geometry 加进了 DEFAULTS，这句话就不成立了 —— 几何现在读得回来，
+    # 往返那条由 case_config_geometry_roundtrip 守着。）
     saved = []
     real_save = cfgmod.save
     cfgmod.save = lambda cfg: saved.append(dict(cfg))
@@ -815,10 +818,13 @@ def case_config_atomic_save() -> None:
     p = cfgmod.CONFIG_PATH
     tmp = p.parent / (p.name + ".tmp")
     cfg = dict(cfgmod.DEFAULTS)
-    cfg["height"] = 200
+    # 值必须跟 DEFAULTS 里的**不一样**（height 的默认是 200）。用默认值的话 load()
+    # 无论文件在不在、是不是刚写的都会返回它，下面那条断言就成了恒真的摆设 ——
+    # 名字声称验了一次往返，实际什么都没验。
+    cfg["height"] = 240
     cfgmod.save(cfg)
     ck("存完之后没留下 .tmp", tmp.exists(), False)
-    ck("存进去的读得回来", cfgmod.load()["height"], 200)
+    ck("存进去的读得回来", cfgmod.load()["height"], 240)
 
     # 替换失败：磁盘满、杀软锁住目标、文件被别的程序占用都会这样。打桩的是 os.replace
     # 本身，所以非原子写（直接 write_text 覆盖目标）在这条下会当场露馅 —— 目标文件已经
@@ -838,7 +844,7 @@ def case_config_atomic_save() -> None:
         os.replace = real_replace
     # 比整份文本而不是只看 height：后者过得去、文件却可能已经被写坏成半截
     ck("原文件一字没变", p.read_text(encoding="utf-8") == before, True)
-    ck("读回来还是老值", cfgmod.load()["height"], 200)
+    ck("读回来还是老值", cfgmod.load()["height"], 240)
     # 失败必须留下痕迹：静默吞掉的写失败，用户只会看到「Key 又没了」而查不出原因
     ck("打了一行「存不了」的日志", "存不了 config.json" in buf.getvalue(), True)
 
