@@ -32,12 +32,16 @@ python tools/make_shortcut.py
 
 ## 配置
 
-配置文件的落点跟运行方式有关：
+配置文件跟运行方式有关：
 
-| 怎么跑的 | `config.json` / `taffy.log` 在哪 |
+| 怎么跑的 | 数据文件在哪 |
 | --- | --- |
 | `python main.py` | 项目根目录 |
 | 装成安装包 | `%APPDATA%\TaffyPet\` |
+
+一共四个数据文件：`config.json`（设置和 API Key）、`chat.json`（聊天记录）、
+`persona.md`（你自己改过的人设；没点过「编辑人设」就没有这个文件，用的是随包的默认版）、
+`taffy.log`（崩溃时写的堆栈）。
 
 装完之后程序本身在 `Program Files` 那类只读目录里，配置只能写用户目录 —— 这个分支在
 `taffy_pet/paths.py` 里，是所有路径的唯一出口。**别的模块不要再自己写 `Path(__file__)`**，
@@ -56,10 +60,12 @@ python tools/make_shortcut.py
 | `volume` | `1.0` | 音量 |
 | `pos` | `null` | 上次退出时的窗口位置，程序自己写 |
 | `hint_shown` | `false` | 首次运行的操作提示弹过没有，程序自己写 |
+| `chat_geometry` | `null` | 聊天窗口上次的位置和大小 `[x, y, w, h]`，程序自己写 |
 
 环境变量优先是为了让人能临时换 Key 而不动文件。
 
-`config.json` 在 `.gitignore` 里 —— 里面有 Key，**绝不能进版本库**。
+`config.json` 在 `.gitignore` 里 —— 里面有 Key，**绝不能进版本库**。`chat.json` 也一样，
+那里面是用户的全部对话；原子写留下的 `.tmp` 中间文件同样排掉了。
 
 ## 重新生成素材
 
@@ -106,12 +112,19 @@ python -m PyInstaller taffy-pet.spec
 ## 自检
 
 ```bash
-python tools/test_units.py    # 纯函数，不需要窗口：余额解析、动画曲线、配置读写
-python tools/smoke.py         # 起窗口 → 截图 → 退出，顺便验弹跳不会溢出窗口
+python tools/test_units.py         # 纯函数，不需要窗口：余额解析、动画曲线、配置读写、SSE 分块解析
+python tools/smoke.py              # 起窗口 → 截图 → 退出，顺便验弹跳不会溢出窗口
+python tools/test_chat.py          # 起本地假接口测网络层：任意分块、取消、各错误码。不要 Key、不要网
+python tools/test_chat_window.py   # 无头建聊天窗：发/收/流式/停止/关窗/历史回填，还有子进程探针
 ```
 
-需要鼠标和网络的部分没法自动测：真实点击、右键菜单、DeepSeek 接口，那几处靠
-`tools/smoke.py` 出图 + 手动点一遍。
+`test_chat.py` 那个假接口**故意每 7 字节切一刀**，专挑汉字中间下手 —— 流式解析写错了
+就是「回复偶尔缺几个字」，靠肉眼基本复现不出来。为什么非得这么切才测得出来，见
+[实现笔记](implementation-notes.md#流式回复的两个坑)。
+
+剩下真的得靠人的：真机点一遍看手感（气泡版面和动画好不好看）、点「编辑人设」改两句
+看下一句生不生效、拿真实 Key 发一次真回复。`test_chat_window.py --shot` 能把聊天窗的
+目检图生成到 `assets/_chat.png`，但图里只有客户区，没有标题栏。
 
 `smoke.py` 输出的截图是 `assets/_*.png`，在 `.gitignore` 里 —— 那只是给人目检用的中间产物，
 随时能重新生成。
@@ -127,11 +140,18 @@ taffy_pet/
   toast.py                 气泡
   balance.py               DeepSeek 余额查询（QThread，不卡界面）
   config.py                配置读写，API Key 的环境变量优先级
+  chat.py                  和 DeepSeek 聊天：流式请求、人设拼装、历史裁剪（QThread）
+  chat_store.py            chat.json 的读写：原子写、上限 200 条、读坏了当空的
+  chat_window.py           聊天窗口：气泡、头像、流式逐字、编辑人设、清空记录
+assets/
+  persona.md               人设（随包的默认版；用户改过的那份在数据目录里）
+  taffy.png 等             立绘、闭眼帧、音效
 tools/                     一次性脚本，不进打包产物
   build_assets.py          白底立绘 → 透明背景立绘 + 闭眼帧
   extract_audio.py         录屏 → 音效
   make_shortcut.py         桌面快捷方式 + 图标
   smoke.py / test_units.py 自检
+  test_chat.py / test_chat_window.py   聊天自检：本地假接口、无头窗口 + 子进程探针
   _blink_explore.py 等     历史探针脚本，留着记录当时怎么试错的
 installer/
   taffy-pet.iss            Inno Setup 脚本（必须存成带 BOM 的 UTF-8）
