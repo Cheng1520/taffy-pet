@@ -59,6 +59,24 @@ def test_apikey() -> None:
     ck("未设置", C.api_key_source({"api_key": ""}), "未设置")
 
 
+def test_persona_path() -> None:
+    print("人设路径：")
+    from taffy_pet import paths as P
+    from pathlib import Path
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        fake_user = Path(d) / "persona.md"
+        old_user, old_default = P.PERSONA_PATH, P.PERSONA_DEFAULT
+        P.PERSONA_PATH, P.PERSONA_DEFAULT = fake_user, P.PERSONA_DEFAULT
+        try:
+            ck("用户没改过就用默认版", P.persona_path(), P.PERSONA_DEFAULT)
+            fake_user.write_text("测试人设", encoding="utf-8")
+            ck("用户改过就用用户的", P.persona_path(), fake_user)
+        finally:
+            P.PERSONA_PATH, P.PERSONA_DEFAULT = old_user, old_default
+
+
 def test_bounce() -> None:
     print("弹跳曲线：")
     curve = A.bounce_curve()
@@ -83,6 +101,7 @@ def test_bounce() -> None:
 def main() -> int:
     test_balance()
     test_apikey()
+    test_persona_path()
     test_bounce()
     print()
     if FAILS:

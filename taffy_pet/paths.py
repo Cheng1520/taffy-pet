@@ -36,6 +36,22 @@ DATA_DIR = (
 CONFIG_PATH = DATA_DIR / "config.json"
 LOG_PATH = DATA_DIR / "taffy.log"
 
+# 人设：用户目录里的优先，没有就用随包的默认版
+PERSONA_PATH = DATA_DIR / "persona.md"
+PERSONA_DEFAULT = ASSETS / "persona.md"
+
+# 聊天记录。里面是用户的全部对话，跟 config.json 一样绝不能进版本库
+CHAT_PATH = DATA_DIR / "chat.json"
+
+
+def persona_path() -> Path:
+    """用户改过就用用户的，否则用随包的默认版。
+
+    每次都重新判断，不缓存 —— 用户点完「编辑人设」保存，下一条消息就该用上，
+    不该等到重启。这个函数每轮对话只调一次，开销可以忽略。
+    """
+    return PERSONA_PATH if PERSONA_PATH.exists() else PERSONA_DEFAULT
+
 
 def ensure_data_dir() -> None:
     """第一次运行（或装完第一次启动）时把用户目录建出来。"""

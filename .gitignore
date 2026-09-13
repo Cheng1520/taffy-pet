@@ -1,6 +1,9 @@
 # API Key 存在这里，绝不能提交
 config.json
 
+# 聊天记录，里面有用户的全部对话，跟 API Key 一样不能提交
+chat.json
+
 # 崩溃时写的堆栈，机器相关，不进版本库
 taffy.log
 

@@ -13,12 +13,13 @@ from pathlib import Path
 
 ROOT = Path(SPECPATH)
 
-# 只带运行时真正用得上的：立绘、闭眼帧、音效。
+# 只带运行时真正用得上的：立绘、闭眼帧、音效、人设。
 # assets/ 里的 _*.png 是目检图、taffy.ico 是给快捷方式和安装程序用的，进包纯白占体积。
 DATAS = [
     (str(ROOT / "assets" / "taffy.png"), "assets"),
     (str(ROOT / "assets" / "taffy_blink.png"), "assets"),
     (str(ROOT / "assets" / "sounds" / "click.wav"), "assets/sounds"),
+    (str(ROOT / "assets" / "persona.md"), "assets"),
 ]
 
 a = Analysis(
