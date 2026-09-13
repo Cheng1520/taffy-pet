@@ -143,6 +143,43 @@ def serve():
     return srv, f"http://127.0.0.1:{srv.server_address[1]}/v1/chat"
 
 
+class _FakeResponse:
+    """最小可用的 requests 响应替身。
+
+    真接口测不到两件事，这两件都只能靠它：
+    - 流被提前 break 时 response 有没有关掉（用户点「停止」走的就是这条）；
+    - 服务端发完 [DONE] 之后**不复用连接也不关连接**（keep-alive 的常见形态）时，
+      客户端会不会一直等到读超时。
+    """
+
+    status_code = 200
+
+    def __init__(self, chunks, per_chunk_sleep=0.0, tail_sleep=0.0):
+        self._chunks = chunks
+        self._per_chunk_sleep = per_chunk_sleep
+        self._tail_sleep = tail_sleep
+        self.closed = False
+        self.waited_past_done = False
+
+    def iter_content(self, chunk_size=None):
+        for c in self._chunks:
+            if self._per_chunk_sleep:
+                time.sleep(self._per_chunk_sleep)
+            yield c
+        # 走到这儿说明 [DONE] 之后客户端还想要下一块 —— 也就是没 break，在等连接
+        self.waited_past_done = True
+        if self._tail_sleep:
+            time.sleep(self._tail_sleep)
+
+    def close(self):
+        self.closed = True
+
+
+def _sse(text: str) -> bytes:
+    return ("data: " + json.dumps({"choices": [{"delta": {"content": text}}]},
+                                  ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
 def run_worker(worker, timeout_ms=8000, stop_after_ms=None, on_chunk=None):
     """跑一个 ChatWorker 等它结束，把三个信号收下来。
 
@@ -233,6 +270,40 @@ def main() -> int:
         ck("停止后能收尾", got["done"] is not None or got["fail"] is not None, True)
         ck("拿到的是部分回复", len(got["done"] or "") < len("".join(PIECES)), True)
         print(f"  ok   停在了 {len(got['done'] or '')} 个字（一共 {len(''.join(PIECES))} 个）")
+
+        print("提前停止时关掉 response：")
+        # 「每条路径都必须关掉 response」是计划的 Global Constraint，而用户点「停止」
+        # 走的正是「提前 break 出流式循环」这条。改前完全没有覆盖：把 chat.py 里
+        # `finally: r.close()` 整段删掉，两套测试照样全绿。
+        fake = _FakeResponse([_sse(p) for p in PIECES] + [b"data: [DONE]\n\n"],
+                             per_chunk_sleep=0.08)
+        real_post = CH.requests.post
+        CH.requests.post = lambda *a, **k: fake
+        try:
+            got = run_worker(CH.ChatWorker("sk-test", [{"role": "user", "content": "x"}]),
+                             stop_after_ms=120)
+        finally:
+            CH.requests.post = real_post
+        ck("这一轮收尾了", got["done"] is not None or got["fail"] is not None, True)
+        # 这条是上面那条的前提：整段都吐完了的话走的是自然结束，压根没 break
+        ck("确实是提前停下的", len(got["done"] or "") < len("".join(PIECES)), True)
+        ck("response 被关掉了", fake.closed, True)
+
+        print("收到 [DONE] 就收尾：")
+        # 服务端发完 [DONE] 之后既不复用也不关连接（keep-alive 很常见）。不 break 的话
+        # 客户端会一直挂到 30 秒读超时 —— 回复早显示完了，「停止」按钮还要亮半分钟。
+        fake2 = _FakeResponse([_sse(p) for p in PIECES] + [b"data: [DONE]\n\n"],
+                              tail_sleep=0.4)
+        real_post = CH.requests.post
+        CH.requests.post = lambda *a, **k: fake2
+        try:
+            got = run_worker(CH.ChatWorker("sk-test", [{"role": "user", "content": "x"}]))
+        finally:
+            CH.requests.post = real_post
+        ck("[DONE] 之后没再要下一块", fake2.waited_past_done, False)
+        # break 不能把已经吐出来的字弄丢 —— 这条是上一条的安全带
+        ck("提前收尾之后回复还是完整的", got["done"], "".join(PIECES))
+        ck("没报错", got["fail"], None)
     finally:
         srv.shutdown()
 

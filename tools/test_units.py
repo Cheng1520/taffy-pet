@@ -81,6 +81,7 @@ def test_chat_store() -> None:
     print("聊天记录：")
     from taffy_pet import chat_store as CS
     from pathlib import Path
+    import json
     import tempfile
 
     with tempfile.TemporaryDirectory() as d:
@@ -105,10 +106,27 @@ def test_chat_store() -> None:
             ck("截断到上限", len(kept), CS.MAX_STORED)
             ck("留下的是最新的", kept[-1]["content"], f"第{CS.MAX_STORED + 49}条")
 
+            # 读侧也要卡上限：save 只管自己写的那些，一份手工改过 / 从别处拷来的
+            # chat.json 会被整份铺出来，而文档写的是「最多 200 条」。
+            # 直接写文件、不走 save —— 走 save 的话截断在写的那一头就发生过了，
+            # 读侧那道限制删掉也照样绿（一条恒真的摆设）。
+            CS.CHAT_PATH.write_text(json.dumps(
+                {"version": CS.VERSION,
+                 "messages": [CS.make("user", f"外来{i}") for i in range(CS.MAX_STORED + 30)]},
+                ensure_ascii=False), encoding="utf-8")
+            ck("读的时候也截到上限", len(CS.load()), CS.MAX_STORED)
+            ck("读侧留的也是最新的", CS.load()[-1]["content"],
+               f"外来{CS.MAX_STORED + 29}")
+
             # 坏文件不能让程序起不来
             CS.CHAT_PATH.write_text("{不是合法 json", encoding="utf-8")
             ck("坏文件当空的处理", CS.load(), [])
-            CS.CHAT_PATH.write_text('{"version": 999, "messages": []}', encoding="utf-8")
+            # 载荷里必须**放一条真消息**。放空的话 load() 返回 [] 跟版本检查毫无关系，
+            # 断言就成了同义反复 —— 实测把版本检查削成 `if not isinstance(data, dict)`
+            # 之后它是全绿通过的，而那是「将来升级格式不炸」的唯一防线。
+            CS.CHAT_PATH.write_text(
+                '{"version": 999, "messages": [{"role": "user", "content": "旧版本的字"}]}',
+                encoding="utf-8")
             ck("版本不认当空的处理", CS.load(), [])
             CS.CHAT_PATH.write_text('{"version": 1, "messages": [{"role":"x"},'
                                     '{"role":"user","content":""},'
@@ -264,16 +282,26 @@ def test_bounce() -> None:
         print("  FAIL 曲线有跳变，关键帧插值断了")
 
 
+def run_case(fn) -> None:
+    """一个用例炸了别把后面的都带下水。
+
+    以前 main() 是平铺的：某个用例抛出没接住的异常，后面所有用例一个都跑不到，
+    输出里也只剩一个 traceback。test_chat_window.py 里同一个病更狠（Qt 的 abort
+    是进程级的），那边一起补了。
+    """
+    try:
+        fn()
+    except Exception as e:                              # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        ck(f"{fn.__name__} 不该抛异常", f"{type(e).__name__}: {e}", None)
+
+
 def main() -> int:
-    test_balance()
-    test_apikey()
-    test_persona_path()
-    test_chat_store()
-    test_chat_prompt()
-    test_load_persona()
-    test_chat_trim()
-    test_sse_parse()
-    test_bounce()
+    for fn in (test_balance, test_apikey, test_persona_path, test_chat_store,
+               test_chat_prompt, test_load_persona, test_chat_trim,
+               test_sse_parse, test_bounce):
+        run_case(fn)
     print()
     if FAILS:
         print(f"失败 {len(FAILS)} 项：" + "、".join(FAILS))
