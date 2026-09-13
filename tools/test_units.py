@@ -77,6 +77,53 @@ def test_persona_path() -> None:
             P.PERSONA_PATH, P.PERSONA_DEFAULT = old_user, old_default
 
 
+def test_chat_store() -> None:
+    print("聊天记录：")
+    from taffy_pet import chat_store as CS
+    from pathlib import Path
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        old = CS.CHAT_PATH
+        CS.CHAT_PATH = Path(d) / "chat.json"
+        try:
+            ck("空目录读出来是空的", CS.load(), [])
+
+            msgs = [CS.make("user", "在吗"), CS.make("assistant", "在呢喵")]
+            CS.save(msgs)
+            back = CS.load()
+            ck("存的条数", len(back), 2)
+            ck("角色", [m["role"] for m in back], ["user", "assistant"])
+            ck("内容", [m["content"] for m in back], ["在吗", "在呢喵"])
+            ck("读了能直接发给接口", [(m["role"], m["content"]) for m in back],
+               [("user", "在吗"), ("assistant", "在呢喵")])
+
+            # 超过上限从最老的截断
+            many = [CS.make("user", f"第{i}条") for i in range(CS.MAX_STORED + 50)]
+            CS.save(many)
+            kept = CS.load()
+            ck("截断到上限", len(kept), CS.MAX_STORED)
+            ck("留下的是最新的", kept[-1]["content"], f"第{CS.MAX_STORED + 49}条")
+
+            # 坏文件不能让程序起不来
+            CS.CHAT_PATH.write_text("{不是合法 json", encoding="utf-8")
+            ck("坏文件当空的处理", CS.load(), [])
+            CS.CHAT_PATH.write_text('{"version": 999, "messages": []}', encoding="utf-8")
+            ck("版本不认当空的处理", CS.load(), [])
+            CS.CHAT_PATH.write_text('{"version": 1, "messages": [{"role":"x"},'
+                                    '{"role":"user","content":""},'
+                                    '{"role":"user","content":"好的"}]}',
+                                    encoding="utf-8")
+            ck("丢掉残缺的条目", [m["content"] for m in CS.load()], ["好的"])
+
+            CS.clear()
+            ck("清空之后", CS.load(), [])
+            CS.clear()   # 再清一次不能炸（文件已经不在了）
+            print("  ok   重复清空不报错")
+        finally:
+            CS.CHAT_PATH = old
+
+
 def test_bounce() -> None:
     print("弹跳曲线：")
     curve = A.bounce_curve()
@@ -102,6 +149,7 @@ def main() -> int:
     test_balance()
     test_apikey()
     test_persona_path()
+    test_chat_store()
     test_bounce()
     print()
     if FAILS:
