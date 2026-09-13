@@ -69,8 +69,11 @@ VersionInfoProductName={#AppName}
 Name: "chinese"; MessagesFile: "{#SourcePath}\languages\ChineseSimplified.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："
-; 桌宠本来就该在桌面上，所以默认勾上
+; 不写 GroupDescription：Inno 在「准备安装」摘要页上自己会打一行「附加任务:」，
+; 再给任务指定分组标题就会变成「附加任务: / 附加任务: / 创建桌面快捷方式」，
+; 重复一行。只有一个任务，也用不着分组。
+; 默认勾上 —— 桌宠本来就该在桌面上。
+Name: "desktopicon"; Description: "创建桌面快捷方式"
 
 [Files]
 ; 整个 dist\TaffyPet\ 原样搬过去，别挑文件 —— PyInstaller 的 _internal\ 里
