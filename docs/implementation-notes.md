@@ -80,8 +80,11 @@ window（`WS_EX_LAYERED`），透明像素点得穿 —— `WindowFromPoint` 打
 
 ## 流式回复的两个坑
 
-聊天窗口的回复是流式的（`chat.py` 的 `parse_sse_lines`）。这两条都**安安静静地错**，
-表现是「回复偶尔缺几个字」，没有报错、没有堆栈，肉眼基本复现不出来。
+聊天窗口的回复是流式的（`chat.py` 的 `parse_sse_lines`）。第一条**安安静静地错**，表现是
+「回复偶尔缺几个字」，没有报错、没有堆栈，肉眼基本复现不出来。第二条不一样：它会当场抛
+`UnicodeDecodeError`，而且 `chat.py` 那段流式循环只接 `requests.RequestException`（接不住
+它，它是 `ValueError` 的子类），异常一路逃到 `run()` 的 `except Exception`，用户看到的是
+明晃晃的一句「出错了：UnicodeDecodeError」—— 不是「偶尔缺几个字」。
 
 ### 网络分块不按行切
 
@@ -105,6 +108,25 @@ window（`WS_EX_LAYERED`），透明像素点得穿 —— `WindowFromPoint` 打
 
 判据见 `taffy_pet/chat.py`，测试在 `tools/test_units.py`（纯函数）和 `tools/test_chat.py`
 （真网络路径）。
+
+## 标题栏上色：取证的前提
+
+`paint_titlebar`（`taffy_pet/chat_window.py`）有两个坑，第一个是取证方式本身。
+
+**没被映射到屏幕的窗口，DWM 根本不合成。** 对着这样一个窗口调
+`PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`，拿回来的是一张**全黑**的图（实测整帧
+265×265 个像素点全部接近黑色），标题栏上没上色从图里一个字都看不出来 —— 黑不是因为没上色，
+是因为根本没画。所以 `tools/test_chat_window.py --titlebar-probe` 那条路子（原生平台 +
+`Qt.WA_DontShowOnScreen`）**永远给不出视觉证据**，它能证明的只有两件事：窗口拿到了一个真的
+HWND（不是 offscreen 那个 `1`），以及两个 `DwmSetWindowAttribute` 都回了 `S_OK`。视觉证据
+得另外取 —— 真上屏的窗口才行（挪到屏幕外、或者被别的窗口盖住都无所谓，只要被映射过）。
+那样抓到的标题栏是 `RGB(251, 227, 234)` = `#FBE3EA`，和 `paint_titlebar` 的 `caption`
+参数逐字节相同。
+
+第二个坑是返回值：`DwmGetWindowAttribute` 对 35/36 回 `E_INVALIDARG`（实测），设完再读回来
+比对这条路走不通，所以每个 `DwmSetWindowAttribute` 的 HRESULT 都必须接住 —— 那是这件事上
+唯一存在的信号。不接的话 DWM 明确拒绝时函数照样报成功，外面那层 `try` 只抓 Python 异常、
+抓不到非零 HRESULT，结果是「上色成功」的标志被置上（不再重试）而一行日志都没有。
 
 ## 打包成安装程序
 

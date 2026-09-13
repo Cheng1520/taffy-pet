@@ -28,7 +28,9 @@ python tools/make_shortcut.py
 ### 同时开了两只？
 
 不会。`main.py` 用 `QLocalServer` 起了个命名管道（`taffy-pet-single-instance`）做单实例保护：
-第二次启动不会开新窗口，而是把已经开着的那只叫到前面来。
+第二次启动不会开新窗口，而是让她蹦一下、冒个泡（`main.py` 的 `_greet`：`animator.pounce()`
++ 气泡）。**没有** `raise_()` / `activateWindow()` —— 默认 `always_on_top=True` 所以效果上
+勉强算「在前面」，但别把它说成「叫到最前面」。
 
 ## 配置
 
@@ -43,9 +45,12 @@ python tools/make_shortcut.py
 `persona.md`（你自己改过的人设；没点过「编辑人设」就没有这个文件，用的是随包的默认版）、
 `taffy.log`（崩溃时写的堆栈）。
 
-装完之后程序本身在 `Program Files` 那类只读目录里，配置只能写用户目录 —— 这个分支在
-`taffy_pet/paths.py` 里，是所有路径的唯一出口。**别的模块不要再自己写 `Path(__file__)`**，
-打包之后那个路径是错的。
+装完之后程序本身在 `%LOCALAPPDATA%\Programs\TaffyPet`（`installer/taffy-pet.iss` 的
+`{autopf}` + `PrivilegesRequired=lowest` 解析出来的就是这儿，只为我安装、全程不弹 UAC），
+这个目录用户可写 —— 数据之所以仍然只能放用户目录，是因为**重装和卸载都会把安装目录整个
+删掉**（`[UninstallDelete]` 删 `{app}`）：`%APPDATA%\TaffyPet` 是卸载器**有意**不碰的，
+那里面是用户的 Key 和聊天记录。这条分支在 `taffy_pet/paths.py` 里，是所有路径的唯一出口。
+**别的模块不要再自己写 `Path(__file__)`**，打包之后那个路径是错的。
 
 ### 全部配置项
 
@@ -69,8 +74,10 @@ python tools/make_shortcut.py
 
 **Key 换不了厂家**：`api_key` 这一项只认 DeepSeek 的 Key，填别家的没用。想换别的厂家或者
 别的模型得改代码 —— `taffy_pet/chat.py` 里的 `API_URL` 和模型名（`MODEL`），以及
-`taffy_pet/balance.py` 里那个余额接口地址。这三处现在都是写死的常量，没有做成配置项，
-其中余额那步还只有 DeepSeek 有这个接口（别家没有对应的服务，不是改个地址就能接上的）。
+`taffy_pet/balance.py` 里那个余额接口地址。这三处现在都是写死的常量，没有做成配置项；
+余额接口是 DeepSeek 专有的地址和载荷，别家即使有类似的余额/额度接口（OpenRouter 的
+`/api/v1/credits`、Moonshot 的 `/v1/users/me/balance` 之类），地址和响应格式也各不相同，
+同样不是改个地址就能接上的。
 
 ## 重新生成素材
 

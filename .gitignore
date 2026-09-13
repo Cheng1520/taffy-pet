@@ -11,6 +11,13 @@ chat.json.tmp
 # **含 API Key**，不忽略的话 git add . 一样会卷进版本库
 config.json.tmp
 
+# 源码方式运行时 paths.DATA_DIR 就是仓库根，于是「编辑人设」会在根目录生成一份
+# persona.md —— 那里面是用户自己的设定，跟 config.json 一样不该进版本库。
+# 前导斜杠是有意的：只匹配仓库根这一份，随包的 assets/persona.md 不在这条规则里
+# （不带斜杠的写法会连它一起匹配上，虽然跟踪中的文件不受 .gitignore 影响，
+# 但 `git check-ignore assets/persona.md` 会报「被忽略」，看着像出了事）。
+/persona.md
+
 # 崩溃时写的堆栈，机器相关，不进版本库
 taffy.log
 
