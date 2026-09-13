@@ -5,17 +5,69 @@
 的 DwmSetWindowAttribute 本来就能做这件事。
 """
 import shutil
+import sys
 
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QPixmap
+from PyQt5.QtCore import Qt, QRectF, QTimer
+from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
-                             QMessageBox, QPushButton, QScrollArea, QTextEdit,
-                             QVBoxLayout, QWidget)
+                             QMessageBox, QPushButton, QScrollArea,
+                             QSizePolicy, QTextEdit, QVBoxLayout, QWidget)
 
 from . import chat as chatmod
 from . import chat_store
 from . import config as cfgmod
 from .paths import ASSETS, PERSONA_DEFAULT, PERSONA_PATH
+
+BUBBLE_R = 14          # 气泡圆角
+TAIL_W = 10            # 尾巴根部宽
+TAIL_H = 9             # 尾巴伸出高度
+PAD_X = 13             # 气泡内边距
+PAD_Y = 9
+HERS_BG = QColor(255, 255, 255)
+HERS_LINE = QColor(240, 190, 205)      # 跟 toast.py 的 BORDER 一致
+MINE_BG = QColor(228, 150, 175)
+MINE_LINE = QColor(221, 134, 163)
+
+AVATAR_H = 56          # 头像立绘的高度；宽度按原图比例走，不固定
+
+QSS = """
+#chatRoot, QScrollArea, #chatArea { background: #FFFBF8; }
+QScrollBar:vertical { background: transparent; width: 8px; margin: 4px 2px 4px 0; }
+QScrollBar::handle:vertical {
+    background: rgba(240, 190, 205, 150); border-radius: 4px; min-height: 30px;
+}
+QScrollBar::handle:vertical:hover { background: rgba(228, 150, 175, 210); }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+#chatInput {
+    background: #FFFFFF; border: 1.4px solid #F0BECD; border-radius: 12px;
+    padding: 6px 10px; color: #3A2E34;
+}
+#chatInput:focus { border: 1.4px solid #E496AF; }
+#sendBtn {
+    background: #E496AF; color: #FFFFFF; border: none; border-radius: 12px;
+}
+#sendBtn:hover { background: #DD86A3; }
+#sendBtn[busy="true"] { background: #B9AEB4; }
+#sendBtn[busy="true"]:hover { background: #A99EA4; }
+#chatBar { background: #FFF6F2; border-top: 1px solid #F6DFE6; }
+"""
+
+_AVATAR = None         # 头像立绘的惰性缓存，见 _avatar_pixmap()
+
+
+def _avatar_pixmap() -> QPixmap:
+    """缩到 56 高、比例不变的立绘。模块级只算一次。
+
+    回填 200 条历史时 `_append_widget` 要走 100 次，每次都从磁盘解码一张 369×800
+    的图再缩放 —— 那是开窗时肉眼可见的卡顿，而这张图在整个进程里根本不会变。
+    """
+    global _AVATAR
+    if _AVATAR is None:
+        pm = QPixmap(str(ASSETS / "taffy.png"))
+        _AVATAR = (pm.scaledToHeight(AVATAR_H, Qt.SmoothTransformation)
+                   if not pm.isNull() else QPixmap())
+    return _AVATAR
 
 
 class ChatInput(QTextEdit):
@@ -34,11 +86,96 @@ class ChatInput(QTextEdit):
         super().keyPressEvent(e)
 
 
-class _PendingLabel(QLabel):
-    """临时占位。对外只暴露 set_text，Task 6 换成真气泡时调用方不用改。"""
+class _Bubble(QWidget):
+    """一个气泡。圆角矩形加一条小尾巴，尾巴只给她的消息 —— 用户的消息靠右，
+    右边贴边没有空间伸尾巴，而且有头像的一侧本来就需要这个锚点。
+
+    自己画而不是用 QSS：QSS 画不出尾巴，而跟 toast.py 保持一致的那套画法
+    这里是现成的。
+    """
+
+    def __init__(self, text: str, mine: bool, parent=None):
+        super().__init__(parent)
+        self.mine = mine
+        self._label = QLabel(text, self)
+        self._label.setWordWrap(True)
+        self._label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._label.setFont(QFont("Microsoft YaHei UI", 10))
+        self._label.setStyleSheet(
+            f"color: {'#FFFFFF' if mine else '#3A2E34'}; background: transparent;")
+
+        lay = QVBoxLayout(self)
+        left = PAD_X if mine else PAD_X + TAIL_W
+        lay.setContentsMargins(left, PAD_Y, PAD_X, PAD_Y)
+        lay.addWidget(self._label)
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+
+    def text(self) -> str:
+        """沿用 QLabel 那套接口。`_on_chunk` 和 Task 5 的测试都按 `text()` 读气泡，
+        换掉 `_PendingLabel` 之后这一层得留着，不然后面调用方全要改。
+        """
+        return self._label.text()
 
     def set_text(self, text: str) -> None:
-        self.setText(text)
+        self._label.setText(text)
+        self.updateGeometry()
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        x = 0 if self.mine else TAIL_W
+        body = QRectF(x + 0.5, 0.5, self.width() - x - 1, self.height() - 1)
+        path = QPainterPath()
+        path.addRoundedRect(body, BUBBLE_R, BUBBLE_R)
+        if not self.mine:
+            tail = QPainterPath()
+            y = min(PAD_Y + 10.0, body.height() / 2)
+            tail.moveTo(body.left() - TAIL_H + 1, y)
+            tail.lineTo(body.left() + 1, y - TAIL_W / 2)
+            tail.lineTo(body.left() + 1, y + TAIL_W / 2)
+            tail.closeSubpath()
+            path = path.united(tail)
+        p.setPen(QPen(MINE_LINE if self.mine else HERS_LINE, 1.2))
+        p.setBrush(MINE_BG if self.mine else HERS_BG)
+        p.drawPath(path)
+
+
+def paint_titlebar(win, caption: str, text_color: str) -> bool:
+    """把系统标题栏刷成她的粉色。
+
+    只在 Windows 11 上有效。Win10 会返回错误码，忽略即可 —— 退回系统默认配色，
+    程序照常跑。所以整段包在 try 里：这是纯装饰，任何情况下都不该让窗口起不来。
+
+    返回值是这件事上**唯一**的信号：DwmGetWindowAttribute 对 35/36 返回
+    E_INVALIDARG（实测），设完再读回来比对这条路走不通。所以每个调用的 HRESULT
+    都得接住 —— 不接的话 DWM 明确拒绝时这一函数照样报成功，外面那层 try 只抓
+    Python 异常、抓不到非零 HRESULT，结果是 `_titlebar_painted` 被置上（不再重试）
+    而一行日志都没有。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        def colorref(s: str) -> int:
+            r, g, b = (int(s[i:i + 2], 16) for i in (1, 3, 5))
+            return r | (g << 8) | (b << 16)
+
+        dwm = ctypes.windll.dwmapi
+        hwnd = ctypes.c_void_p(int(win.winId()))
+        for attr, val in ((35, colorref(caption)),      # DWMWA_CAPTION_COLOR
+                          (36, colorref(text_color))):  # DWMWA_TEXT_COLOR
+            c = ctypes.c_int(val)
+            hr = dwm.DwmSetWindowAttribute(hwnd, ctypes.c_uint(attr),
+                                           ctypes.byref(c), ctypes.sizeof(c))
+            if hr != 0:
+                print(f"[chat] 标题栏上色失败（不影响使用）："
+                      f"attr={attr} HRESULT=0x{hr & 0xFFFFFFFF:08X}")
+                return False
+        return True
+    except Exception as e:                              # noqa: BLE001
+        print(f"[chat] 标题栏上色失败（不影响使用）：{e}")
+        return False
 
 
 class ChatWindow(QWidget):
@@ -71,6 +208,7 @@ class ChatWindow(QWidget):
 
     # ---------- 搭界面 ----------
     def _build_ui(self) -> None:
+        self.setObjectName("chatRoot")
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -81,6 +219,7 @@ class ChatWindow(QWidget):
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         self.area = QWidget()
+        self.area.setObjectName("chatArea")
         self.msgs = QVBoxLayout(self.area)
         self.msgs.setContentsMargins(14, 14, 14, 14)
         self.msgs.setSpacing(10)
@@ -89,19 +228,24 @@ class ChatWindow(QWidget):
         root.addWidget(self.scroll, 1)
 
         bar = QWidget()
+        bar.setObjectName("chatBar")
         row = QHBoxLayout(bar)
         row.setContentsMargins(14, 10, 14, 12)
         row.setSpacing(8)
         self.input = ChatInput(self.send)
+        self.input.setObjectName("chatInput")
         self.input.setPlaceholderText("和 taffy 说点什么…（回车发送，Shift+回车换行）")
         self.input.setFixedHeight(72)
         row.addWidget(self.input, 1)
 
         self.btn = QPushButton("发送")
+        self.btn.setObjectName("sendBtn")
         self.btn.setFixedSize(72, 72)
         self.btn.clicked.connect(self._on_button)
         row.addWidget(self.btn)
         root.addWidget(bar)
+
+        self.setStyleSheet(QSS)
 
     def _at_bottom(self) -> bool:
         bar = self.scroll.verticalScrollBar()
@@ -115,6 +259,21 @@ class ChatWindow(QWidget):
         # 插在弹簧前面，否则新消息会跑到下面去
         self.msgs.insertWidget(self.msgs.count() - 1, widget)
 
+    def _apply_bubble_width(self) -> None:
+        """气泡最宽只占视口的 75%。
+
+        窗口可以缩放，写死像素必然错，所以按当前视口宽实时算。`resizeEvent` 和
+        `_append_widget` 各调一次 —— 只在 resizeEvent 里刷的话，窗口最后一次缩放
+        之后新产生的气泡拿的还是默认上限，长消息会直接顶满整行。
+        """
+        limit = int(self.scroll.viewport().width() * 0.75)
+        for b in self.area.findChildren(_Bubble):
+            b.setMaximumWidth(limit)
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._apply_bubble_width()
+
     # ---------- 渲染 ----------
     def _render_history(self) -> None:
         for m in self.history:
@@ -124,24 +283,46 @@ class ChatWindow(QWidget):
         QTimer.singleShot(0, self._scroll_to_bottom)
 
     def _append_widget(self, text: str, mine: bool):
-        """Task 6 会换成带头像和尾巴的版本。
+        """返回那个气泡控件；真正插进布局的是 `bubble._outer`。
 
-        返回的控件上挂一个 `_outer`，指向真正被塞进布局的那个顶层控件 ——
-        Task 6 加了头像之后，「返回的气泡」和「插进布局的那一行」就不是同一个了，
-        中途要撤销的时候得删对那个。Task 5 里两者是同一个。
+        Task 5 里「返回的控件」和「插进布局的控件」是同一个。这一轮她那边多了一层
+        装头像的行，两者不再相等 —— `_drop_pending` 靠 `_outer` 删对那一个，删错的
+        话气泡没了、那一行还杵在消息区里。
         """
-        lab = _PendingLabel(text)
-        lab.setWordWrap(True)
-        lab.setAlignment(Qt.AlignRight if mine else Qt.AlignLeft)
-        lab._outer = lab
-        self._add(lab)
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        bubble = _Bubble(text, mine)
+        if mine:
+            row.addStretch(1)
+            row.addWidget(bubble)
+        else:
+            avatar = QLabel()
+            avatar.setStyleSheet("background: transparent;")
+            pm = _avatar_pixmap()
+            if not pm.isNull():
+                avatar.setPixmap(pm)
+                # 跟着缩放后的立绘走，不写死 56。原图 369×800 缩到 56 高只有 26 宽，
+                # 框成 56×56 的话右边会空出 30px，正好夹在头像和气泡中间把它们推远。
+                avatar.setFixedSize(pm.width(), pm.height())
+            row.addWidget(avatar, 0, Qt.AlignTop)
+            row.addWidget(bubble)
+            row.addStretch(1)
+        bubble._outer = holder          # 中途要撤销的时候删的是这个，不是 bubble
+        self._add(holder)
+        # 新气泡也得吃到 75% 上限。只靠 resizeEvent 的话，窗口最后一次缩放之后
+        # 产生的气泡拿的是默认上限，长消息会超出去。
+        self._apply_bubble_width()
         QTimer.singleShot(0, self._scroll_to_bottom)
-        return lab
+        return bubble
 
     def _append_notice(self, text: str) -> None:
         lab = QLabel(text)
-        lab.setWordWrap(True)
         lab.setAlignment(Qt.AlignCenter)
+        lab.setWordWrap(True)
+        lab.setStyleSheet("color: #96848C; font-family: 'Microsoft YaHei UI';"
+                          " font-size: 9.5pt; padding: 6px;")
         self._add(lab)
 
     # ---------- 发送 ----------
@@ -215,6 +396,10 @@ class ChatWindow(QWidget):
 
     def _set_busy(self, busy: bool) -> None:
         self.btn.setText("停止" if busy else "发送")
+        # busy 是动态属性，QSS 不认属性变化，得手动重刷一遍才重算
+        self.btn.setProperty("busy", "true" if busy else "false")
+        self.btn.style().unpolish(self.btn)
+        self.btn.style().polish(self.btn)
 
     # ---------- 生命周期 ----------
     def _stop_worker(self) -> None:
@@ -236,6 +421,9 @@ class ChatWindow(QWidget):
                 # 没杀干净就绝不能放手。线程还活着而引用丢了，窗口析构时 Qt 照样 abort
                 # （见 __init__ 里那段）。宁可把引用留着，等下一次收尾
                 # （关窗 / aboutToQuit）再试一次。
+                # 这一支**有意不调** _set_busy(False)：线程是真的卡住了，按钮停在
+                # 「停止」是诚实的；显示「发送」的话用户点下去会被 send() 里
+                # worker is not None 的守卫静默吞掉，界面反而在撒谎。别「顺手修掉」。
                 print("[chat] 强杀没成功，线程还活着，先留着引用不析构")
                 self._drop_pending()
                 return
@@ -252,6 +440,12 @@ class ChatWindow(QWidget):
         self._save_geometry()
         cfgmod.save(self.cfg)
         super().closeEvent(e)
+
+    def showEvent(self, e) -> None:
+        super().showEvent(e)
+        if not getattr(self, "_titlebar_painted", False):
+            # 得等窗口真的建出来再调，winId() 之前拿到的可能不是最终的那个句柄
+            self._titlebar_painted = paint_titlebar(self, "#FBE3EA", "#3A2E34")
 
     def show_and_raise(self) -> None:
         self.show()

@@ -1,6 +1,7 @@
-"""聊天窗口的冒烟测试：能发、能收、能流式、能停、能关。
+"""聊天窗口的冒烟测试：能发、能收、能流式、能停、能关，以及好不好看里能验的那几条。
 
-    PYTHONUTF8=1 python tools/test_chat_window.py
+    PYTHONUTF8=1 python tools/test_chat_window.py        # 跑测试
+    PYTHONUTF8=1 python tools/test_chat_window.py --shot # 生成目检图 assets/_chat.png
 
 Task 5 的手动验证（真填一个 Key、发一句「你好」、肉眼看打字机效果和四条边界）
 既没有 Key 也没人坐在 GUI 前面，做不了。这个文件把那几条换成无头断言：起一个
@@ -8,6 +9,15 @@ Task 5 的手动验证（真填一个 Key、发一句「你好」、肉眼看打
 真的 ChatWindow，把「发出去的消息落盘了没、流式的字拼全了没、点停止留没留住
 已经吐出来的半句、流式中关窗会不会崩、重开窗口历史回没回来、右键菜单连点两次
 会不会开出两个窗口」全部钉死。
+
+Task 6 加了视觉，但视觉里只有一半能自动验（气泡真画出来了、两边底色、75% 宽度
+上限、头像框贴合立绘）。「好不好看」本身验不了，也不假装验过 —— 那几条留给用户，
+`--shot` 只负责把图生成好放在那儿。**图里不会有标题栏**（grab() 只抓客户区），
+标题栏单独在 case_titlebar 里验，它换到原生平台的子进程去跑。
+
+跑测试的主进程钉在 offscreen 上，所以 `[chat] 标题栏上色失败…HRESULT=0x80070006`
+那行日志是**正常的**：offscreen 没有原生窗口，DWM 当然拒绝。产品代码在那里就是
+该打印 + 返回 False（不打印才是缺陷），别把它当成失败。
 
 **路径隔离（这条最要紧）**：非打包运行时 paths.DATA_DIR 就是仓库根目录，也就是说
 仓库根下的 config.json 是用户真实的配置文件（里面有他的 DeepSeek API Key）、
@@ -36,7 +46,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 # 顺便还能白拿它模块级设的 NO_PROXY（绕开本机系统代理对 127.0.0.1 的劫持）。
 import test_chat as TC                                  # noqa: E402
 
-from PyQt5.QtCore import QEventLoop, QTimer             # noqa: E402
+from PyQt5.QtCore import Qt, QEventLoop, QTimer         # noqa: E402
 from PyQt5.QtWidgets import QApplication, QMessageBox   # noqa: E402
 
 from taffy_pet import chat as CH                        # noqa: E402
@@ -91,13 +101,40 @@ def wait_until(pred, timeout_ms: int = 8000, step_ms: int = 20) -> bool:
 
 
 def texts(win) -> list:
-    """按顺序读出消息区里每个气泡/提示的文字（末尾那个弹簧没有控件，跳过）。"""
+    """按顺序读出消息区里每个气泡/提示的文字（末尾那个弹簧没有控件，跳过）。
+
+    Task 6 之后气泡外面多了一层装头像的行（`_Bubble._outer`），插进 `msgs` 的是
+    那一行而不是气泡本身，所以这里得往下找一趟 —— 直接 `w.text()` 拿到的是
+    「QWidget 没有 text」的异常。
+
+    找不到气泡的行**故意**不兜底：那正是「半句气泡没删干净、空壳留在消息区里」
+    的样子（`_drop_pending` 删错控件时就是这样），让它原样炸出来比吞掉强。
+    """
     out = []
     for i in range(win.msgs.count()):
         w = win.msgs.itemAt(i).widget()
-        if w is not None:
-            out.append(w.text())
+        if w is None:
+            continue
+        bubble = w if isinstance(w, CW._Bubble) else w.findChild(CW._Bubble)
+        out.append(bubble.text() if bubble is not None else w.text())
     return out
+
+
+def rows(win) -> int:
+    """消息区里有几个顶层控件（末尾那个弹簧不算）。
+
+    跟 texts() 分开：texts() 只读得出**有文字**的控件，而行数看的是「到底插进去了
+    几个顶层控件」。Task 6 之后一个气泡外面还套着一层装头像的行，`_drop_pending`
+    靠 `bubble._outer` 删对那个 —— 删错的话留下来的正是那个**行**，它自己没有文字，
+    只有数行数才看得见（界面上的表现是消息区里多出一块空白）。
+    """
+    return sum(1 for i in range(win.msgs.count())
+               if win.msgs.itemAt(i).widget() is not None)
+
+
+def pixel(widget, x: int, y: int) -> int:
+    """控件自己抓一张图，取 (x, y) 那点的颜色。"""
+    return widget.grab().toImage().pixel(x, y)
 
 
 def reset_handler() -> None:
@@ -136,6 +173,10 @@ def case_no_key() -> None:
     win.input.setPlainText("在吗")
     win.send()
     ck("这一轮立刻收尾了", wait_until(lambda: win.worker is None), True)
+    # 先数行数再看文字：Task 6 之后气泡外面套着一层装头像的行，_drop_pending 删错控件
+    # 的话留下的就是那个没有文字的行 —— 只有行数看得见它，而且它会把下面的 texts()
+    # 直接炸掉，先在这儿点名比看一句 AttributeError 强。
+    ck("消息区就三行（欢迎语+用户行+提示），半句那一行整行删掉了", rows(win), 3)
     ck("给了「还没设置 API Key」的提示",
        any("还没设置 API Key" in t for t in texts(win)), True)
     ck("空的那个半句气泡清掉了", win.pending, None)
@@ -271,11 +312,14 @@ def case_close_mid_stream() -> None:
 
     # brief Step 3 第 3 条的另一半：close() 只是把窗口藏起来，同一个对象还能 show 回来。
     # 重开之后消息区必须和落盘对得上 —— 多出任何一条盘里没有的东西就是幽灵气泡。
+    # 比的是**整份**而不是尾巴：只比尾巴的话，将来中间多插一条也照样绿。欢迎语是个
+    # 例外（它本来就不落盘），排掉它，剩下的必须一条不多一条不少地等于落盘那些。
+    welcome = "和 taffy 打个招呼吧喵"
     win.show()
     pump(50)
-    shown = [t for t in texts(win) if t.strip()]
+    shown = [t for t in texts(win) if t.strip() and t != welcome]
     ck("重开同一个窗口，消息区就是落盘的那些",
-       shown[-len(chat_store.load()):], [m["content"] for m in chat_store.load()])
+       shown, [m["content"] for m in chat_store.load()])
     win.close()
 
 
@@ -407,13 +451,27 @@ def case_on_done_overwrites_bubble() -> None:
     win.send()
     pend = win.pending
 
+    # 这条用例是**同步直调** _on_done 的，而 _on_done 会把 self.worker 置 None；紧跟的
+    # close() → _stop_worker() 就撞上 `if self.worker is None: return` 早退，那条真线程
+    # 既没 stop 也没 disconnect。复审实测过：用例结束后泵 800ms，_on_done **第二次**跑到
+    # 槽里，内存 history 2→3、盘里也 2→3，凭空多一条重复 assistant。所以先把引用接住，
+    # 断言做完自己收尾。
+    leaked = win.worker
+    # M14：ChatWorker 是不给 parent 的。上面接住引用之后这一条就不再靠崩溃暴露了
+    # （线程被漏掉时窗口析构会 abort），改成明写的一句断言守着它 —— 生命周期得跟着窗口走。
+    ck("worker 挂在窗口上（生命周期跟着窗口走）", win.worker.parent(), win)
+
     win.pending_text = "攒歪了的字"
     pend.set_text("攒歪了的字")
     win._on_done(FULL)
 
     ck("气泡被覆盖成 _on_done 收到的文本", pend.text(), FULL)
     ck("落盘的也是那份", chat_store.load()[-1]["content"], FULL)
-    ck("两者一致", pend.text(), chat_store.load()[-1]["content"])
+    # 上面两条已经蕴含了「气泡和落盘一致」，单独再写一条是永远不可能红的空断言，
+    # 不加。
+    leaked.stop()                  # 被 _on_done 撇下的那条活线程，自己收干净
+    leaked.disconnect()
+    leaked.wait(3000)
     win.close()
 
 
@@ -463,6 +521,7 @@ def case_wedged_worker_keeps_ref() -> None:
     win.worker = stub
     win.pending_text = "半句"
     win.pending = win._append_widget("半句", False)   # 顺手验这一支也会清半句
+    win._set_busy(True)                               # 走到这一支时按钮本来就停在「停止」
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):             # 不动产品代码，只在外面接 print
@@ -476,10 +535,106 @@ def case_wedged_worker_keeps_ref() -> None:
     ck("打了「强杀没成功」那行日志", "强杀没成功" in log, True)
     ck("这一支也把半句气泡清了", win.pending, None)
     ck("攒的残字也清了", win.pending_text, "")
+    # 这一支**有意**不把按钮切回「发送」（chat_window.py 那儿有注释说明）：
+    # 线程是真的卡住了，显示「发送」的话用户点下去会被 send() 里的守卫静默吞掉。
+    ck("按钮停在「停止」，不假装能再发", win.btn.text(), "停止")
 
     # 桩没法真的收尾，摘掉再关窗，别让它挂到窗口析构那一刻
     win.worker = None
     win.close()
+
+
+def case_bubbles_painted() -> None:
+    """视觉里能自动验的四条：气泡真画出来了、两边底色对、75% 上限、头像框贴合立绘。
+
+    Step 4 那八条里剩下的四条要肉眼（版面好不好看），留在用户手上 —— `--shot`
+    只负责把图生成好。这里不验「好不好看」，也不假装验过。
+    """
+    print("气泡视觉：")
+    chat_store.clear()
+    win = new_window({"api_key": "sk-test"})
+    win.resize(420, 560)
+    win.show()          # 布局要真跑过一遍，grab() 才拿得到几何
+    pump(50)
+
+    mine = win._append_widget("我这边说的", True)
+    hers = win._append_widget("她那边说的喵", False)
+    pump(50)
+
+    # 1+2：气泡顶部正中那一点。正常渲染下它落在填充区里 —— 圆角够不着、1.2px 的
+    # 边框线也够不着。paintEvent 被掏空的话那一点会落回 QWidget.grab() 的兜底底色
+    # #EFEFEF（实测），跟两边任何一个填充色都不等，所以这两条会一起红。
+    ck("她的气泡填的是 HERS_BG，不是空白",
+       pixel(hers, hers.width() // 2, 2), CW.HERS_BG.rgb())
+    ck("我的气泡填的是 MINE_BG，不是空白",
+       pixel(mine, mine.width() // 2, 2), CW.MINE_BG.rgb())
+
+    # 3：75% 上限。视口宽度不写死 —— 滚动条在不在会让它差 8px，按当前值算。
+    vp = win.scroll.viewport().width()
+    ck("两个气泡的宽度上限都是视口的 75%",
+       (mine.maximumWidth(), hers.maximumWidth()), (int(vp * 0.75), int(vp * 0.75)))
+
+    # 3 的另一半：窗口缩放之后要跟着变
+    win.resize(700, 560)
+    pump(50)
+    vp2 = win.scroll.viewport().width()
+    ck("缩放确实改变了视口宽度（否则下一条是白给的）", vp2 != vp, True)
+    ck("缩放窗口后两个气泡的上限跟着变",
+       (mine.maximumWidth(), hers.maximumWidth()), (int(vp2 * 0.75), int(vp2 * 0.75)))
+
+    # 3 的第三半：窗口最后一次缩放**之后**新加的气泡也得吃到。只在 resizeEvent 里刷的
+    # 实现漏掉的正是这一条 —— 新气泡一直拿着默认上限，长消息会直接顶满整行。
+    late = win._append_widget("缩放之后才加的一条消息", False)
+    ck("缩放之后新加的气泡也吃到 75% 上限", late.maximumWidth(), int(vp2 * 0.75))
+
+    # 4：头像框贴合缩放后的立绘。原图 369×800 缩到 56 高只有 26 宽；框成 56×56 的话
+    # 右边会空出 30px，正好夹在头像和气泡中间把它们推远 —— 用户一眼能看见的就是这个。
+    pm = CW._avatar_pixmap()
+    ck("立绘按原比例缩到 26 宽 56 高", (pm.width(), pm.height()), (26, 56))
+    avatar = hers._outer.layout().itemAt(0).widget()
+    ck("头像控件的宽度就是立绘的宽度（右边不留空）", avatar.width(), pm.width())
+    ck("头像控件的高度就是立绘的高度", avatar.height(), pm.height())
+    win.close()
+
+
+def case_titlebar() -> None:
+    """标题栏上色（Step 3）：这条能真测，但必须在**原生平台**的子进程里测。
+
+    主进程为了无头跑测试把 QT_QPA_PLATFORM 钉在 offscreen 上，而 offscreen 压根没有
+    原生窗口 —— 实测 `int(win.winId())` 是 1，DwmSetWindowAttribute 回 E_HANDLE
+    （0x80070006），于是 paint_titlebar 返回 False。那**不是**产品代码的问题，是平台的
+    问题，在那一层断言它就是假红。
+
+    子进程用默认的 windows 平台 + `WA_DontShowOnScreen`：建得出真 HWND（实测是个七位数
+    的真句柄）、又不映射到屏幕上，不会在用户桌面上闪一下。实测两个 DwmSetWindowAttribute
+    都回 S_OK，所以那边可以断言 True。
+
+    非 Win11 直接跳过：DWMWA_CAPTION_COLOR 是 Win11 才有的，Win10 退回系统默认配色
+    本来就是设计内的行为（这个仓库没有 CI），别让它变成假红。
+    """
+    print("标题栏上色（子进程，原生平台）：")
+    if sys.platform != "win32":
+        print("    跳过：不是 Windows，paint_titlebar 返回 False 是设计内的")
+        return
+    build = sys.getwindowsversion().build
+    if build < 22000:
+        print(f"    跳过：Windows build {build} 没有 DWMWA_CAPTION_COLOR（Win11 才有），"
+              f"退回系统默认配色是设计内的")
+        return
+    env = dict(os.environ, PYTHONUTF8="1")
+    me = str(Path(__file__).resolve())   # 平台由子进程自己改成 windows，见 _titlebar_probe
+    r = subprocess.run([sys.executable, "-u", me, "--titlebar-probe"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=env, timeout=120)
+    out = r.stdout or ""
+    ck("子进程里拿到的是真 HWND（不是 offscreen 那个 1）", "真HWND=True" in out, True)
+    # 返回值是这件事上唯一存在的信号 —— DwmGetWindowAttribute 读不回来（E_INVALIDARG）。
+    ck("两个 DwmSetWindowAttribute 都回 S_OK，标题栏真的上色了",
+       "painted=True" in out, True)
+    if r.returncode or "painted=True" not in out:
+        print(f"    子进程 stdout：{out.strip()}")
+        print(f"    子进程 stderr：{(r.stderr or '').strip()}")
+    ck("子进程正常退出", r.returncode, 0)
 
 
 def case_menu_entry() -> None:
@@ -530,6 +685,31 @@ def case_quit_while_streaming() -> None:
         print(f"    子进程 stderr：{(r.stderr or '').strip()}")
 
 
+# ---------- 子进程模式 ----------
+def _titlebar_probe() -> int:
+    """子进程模式：用原生平台建一个不映射到屏幕的真窗口，验标题栏上色。
+
+    **这里不打断言**，理由跟 _quit_probe 一样：判断留给父进程那个 case_titlebar，
+    这一层只负责把事实（HWND 是不是真的、paint_titlebar 返回了什么）打出来。
+    """
+    tmp = tempfile.mkdtemp(prefix="taffy-titlebar-")
+    _isolate_paths(tmp)
+    # 文件头为了无头测试把平台钉成 offscreen 了，这一条就是来测原生窗口的，得改回来。
+    # 平台插件是在 QApplication 构造时选的，所以在这里改还来得及。
+    os.environ["QT_QPA_PLATFORM"] = "windows"
+    app = QApplication([sys.argv[0]])           # noqa: F841  别把 --titlebar-probe 塞给 Qt
+    win = CW.ChatWindow({})
+    win.setAttribute(Qt.WA_DontShowOnScreen, True)   # 建真窗口，但不映射到屏幕上
+    win.show()
+    pump(200)
+    hwnd = int(win.winId())
+    print(f"[titlebar-probe] winId={hwnd} 真HWND={hwnd > 0xFFFF} "
+          f"painted={bool(getattr(win, '_titlebar_painted', False))}", flush=True)
+    win.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+    return 0
+
+
 def _quit_probe() -> int:
     """子进程模式：忠实复刻 main.py 的启动/退出 —— 流式中直接 QApplication.quit()。
 
@@ -573,6 +753,42 @@ def _quit_probe() -> int:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _shot() -> int:
+    """目检模式：把一段假对话渲染成 assets/_chat.png，省掉「自己跑一遍程序」。
+
+    **这里也走原生平台**，不用 offscreen。实测 offscreen 下一个字都画不出来 ——
+    假接口那套字体后端拿不到字形，气泡、按钮、输入框全是空的，图就成了一张没有
+    文字的线框，目检个啥。所以跟 _titlebar_probe 一样换成 windows 平台，再用
+    `WA_DontShowOnScreen` 保证窗口不映射到屏幕上。
+
+    **图里不会有标题栏**：`grab()` 只抓客户区，系统标题栏是非客户区，本来就不在里面
+    —— 上没上色从这张图上看不出来（虽然这一跑确实把它刷粉了），标题栏的验证走
+    case_titlebar。
+    """
+    tmp = tempfile.mkdtemp(prefix="taffy-chatshot-")
+    _isolate_paths(tmp)
+    os.environ["QT_QPA_PLATFORM"] = "windows"   # offscreen 画不出字，见上面那段
+    app = QApplication([sys.argv[0]])           # noqa: F841  建控件要用，必须接住引用
+    chat_store.save([
+        chat_store.make("user", "在吗"),
+        chat_store.make("assistant", "在呢喵～今天想聊点什么？"),
+        chat_store.make("user", "今天有点累，随便聊聊吧"),
+        chat_store.make("assistant", "那就先把肩膀放松一下，别看屏幕啦。\n我在这儿陪你。"),
+    ])
+    win = CW.ChatWindow({})
+    win.setAttribute(Qt.WA_DontShowOnScreen, True)   # 建真窗口，但不映射到屏幕上
+    win.resize(420, 560)
+    win.show()
+    pump(300)
+    out = Path(CW.ASSETS) / "_chat.png"
+    ok = win.grab().save(str(out))
+    print(f"目检图：{out}（{'保存成功' if ok else '保存失败'}）")
+    print("    注意：grab() 只抓客户区，系统标题栏不在图里 —— 不是上色坏了。")
+    win.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+    return 0 if ok else 1
+
+
 def main() -> int:
     # 环境变量优先于 config.json，真设了的话「没 Key」那条用例就不成立了
     os.environ.pop("DEEPSEEK_API_KEY", None)
@@ -591,7 +807,9 @@ def main() -> int:
         run_case(case_clear_history)
         run_case(case_two_sends_same_window)
         run_case(case_on_done_overwrites_bubble)
+        run_case(case_bubbles_painted)
         run_case(case_wedged_worker_keeps_ref)
+        run_case(case_titlebar)
         run_case(case_quit_while_streaming)
         run_case(case_menu_entry)
     finally:
@@ -607,4 +825,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(_quit_probe() if "--quit-probe" in sys.argv else main())
+    if "--titlebar-probe" in sys.argv:
+        sys.exit(_titlebar_probe())
+    if "--quit-probe" in sys.argv:
+        sys.exit(_quit_probe())
+    if "--shot" in sys.argv:
+        sys.exit(_shot())
+    sys.exit(main())
