@@ -15,6 +15,8 @@ chat.json 是他真实的聊天记录。而 ChatWindow.closeEvent 会调 cfgmod.
 聊天记录每次发送都会 chat_store.save() —— 测试里跑一遍真窗口就会把用户的东西
 覆盖掉。所以建窗口之前必须先把这两个模块的路径常量指到临时目录去。
 """
+import contextlib
+import io
 import os
 import shutil
 import subprocess
@@ -415,6 +417,71 @@ def case_on_done_overwrites_bubble() -> None:
     win.close()
 
 
+class _WedgedWorker:
+    """一个 `terminate()` 杀不掉的 worker —— 只为了把 I3 那条兜底分支跑到。
+
+    不是 QThread，所以想桩什么就桩什么。真的 `QThread` 上做不出这个桩：`wait()` /
+    `isRunning()` 是 sip 生成的槽，实例上覆盖不了，`self.worker.wait = lambda ms: False`
+    会直接报 AttributeError。整个换成普通 Python 对象就绕开了这件事 —— `_stop_worker`
+    只用到 `stop` / `disconnect` / `wait` / `terminate` / `isRunning` 五个方法，桩得出来。
+    """
+
+    def __init__(self):
+        self.waits = []
+        self.terminate_called = False
+
+    def stop(self) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        pass
+
+    def wait(self, ms: int) -> bool:
+        self.waits.append(ms)
+        return False                     # 第一次等超时、强杀之后再等还是超时
+
+    def terminate(self) -> None:
+        self.terminate_called = True
+
+    def isRunning(self) -> bool:
+        return True                      # 强杀之后照样活着
+
+
+def case_wedged_worker_keeps_ref() -> None:
+    """I3 的兜底分支：`terminate()` 之后线程还活着时，**绝不能把引用丢掉**。
+
+    白盒，理由：这一支在真机上**走不到** —— Windows 的 `terminate()` 走 `TerminateThread`，
+    `wait(500)` 回来 `isRunning()` 稳定是 False（跑 C1 那个探针时实测过），所以拿真线程
+    构造不出「杀不死」这个状态。可它守的恰恰是 C1 那条 abort 路：线程还活着而引用丢了，
+    窗口析构时 Qt 照样 abort。既然构造不出真状态，就把 worker 换成一个 terminate()
+    杀不掉的桩，直接验分支本身。
+    """
+    print("兜底：terminate 没杀干净时保住引用：")
+    chat_store.clear()
+    win = new_window({"api_key": "sk-test"})
+    stub = _WedgedWorker()
+    win.worker = stub
+    win.pending_text = "半句"
+    win.pending = win._append_widget("半句", False)   # 顺手验这一支也会清半句
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):             # 不动产品代码，只在外面接 print
+        win._stop_worker()
+    log = buf.getvalue()
+
+    ck("两次 wait 都被调到了", stub.waits, [3000, 500])
+    ck("强杀确实试过了", stub.terminate_called, True)
+    # 最要紧的一条。丢了它，线程还活着而窗口析构时 Qt 直接 abort(0xC0000409) —— C1。
+    ck("线程还活着时没把 worker 置 None", win.worker, stub)
+    ck("打了「强杀没成功」那行日志", "强杀没成功" in log, True)
+    ck("这一支也把半句气泡清了", win.pending, None)
+    ck("攒的残字也清了", win.pending_text, "")
+
+    # 桩没法真的收尾，摘掉再关窗，别让它挂到窗口析构那一刻
+    win.worker = None
+    win.close()
+
+
 def case_menu_entry() -> None:
     """pet.py 的那个临时入口：连点两次只开一个窗口（brief Step 3 的第 4 条）。
 
@@ -524,6 +591,7 @@ def main() -> int:
         run_case(case_clear_history)
         run_case(case_two_sends_same_window)
         run_case(case_on_done_overwrites_bubble)
+        run_case(case_wedged_worker_keeps_ref)
         run_case(case_quit_while_streaming)
         run_case(case_menu_entry)
     finally:
