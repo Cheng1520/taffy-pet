@@ -139,6 +139,30 @@ def test_chat_prompt() -> None:
     ck("带上了不许提 DeepSeek", "不要提到 DeepSeek" in p, True)
 
 
+def test_load_persona() -> None:
+    print("人设读取：")
+    from taffy_pet import chat as CH
+    from pathlib import Path
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "persona.md"
+        old = CH.persona_path
+        CH.persona_path = lambda: p
+        try:
+            p.write_text("你是塔菲。", encoding="utf-8")
+            ck("正常读得到", "你是塔菲。" in CH.load_persona(), True)
+
+            # 用户拿记事本存成 ANSI/GBK —— 这是这个功能最可能出的岔子
+            p.write_bytes("你是塔菲。".encode("gbk"))
+            ck("GBK 存盘走兜底不崩", "永雏塔菲" in CH.load_persona(), True)
+
+            p.unlink()
+            ck("文件没了也走兜底", "永雏塔菲" in CH.load_persona(), True)
+        finally:
+            CH.persona_path = old
+
+
 def test_chat_trim() -> None:
     print("历史裁剪：")
     from taffy_pet import chat as CH
@@ -244,6 +268,7 @@ def main() -> int:
     test_persona_path()
     test_chat_store()
     test_chat_prompt()
+    test_load_persona()
     test_chat_trim()
     test_sse_parse()
     test_bounce()
