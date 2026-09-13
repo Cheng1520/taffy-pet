@@ -1,6 +1,9 @@
 # API Key 存在这里，绝不能提交
 config.json
 
+# 崩溃时写的堆栈，机器相关，不进版本库
+taffy.log
+
 __pycache__/
 *.py[cod]
 .venv/

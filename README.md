@@ -12,6 +12,32 @@ pip install -r requirements.txt
 python main.py
 ```
 
+想让以后双击就能启动，再跑一次这个：
+
+```bash
+python tools/make_shortcut.py
+```
+
+它生成 `assets/taffy.ico`（拿她的头做的），并在桌面创建「塔菲」快捷方式。快捷方式指向
+`pythonw.exe` 而不是 `python.exe` —— 后者会在桌面上挂一个黑框命令行，手一抖关掉它
+还会把塔菲一起带走。**这个脚本只在你机器上跑一次，不需要重新生成素材。**
+
+## 启动与退出
+
+| 想干嘛 | 怎么做 |
+| --- | --- |
+| 启动 | 双击桌面上的「塔菲」图标 |
+| 退出 | **右键点她 → 退出**（退出时会记住位置，下次启动还在原地） |
+| 看不到她 | 她在**屏幕右下角、任务栏上方**，大概占屏幕高度的四分之一 |
+| 调 bug | 别用图标，在项目目录跑 `python main.py`，日志直接打在控制台里 |
+
+双击图标**不会起出第二只塔菲**：第二个进程发现已经有一只了，会让那只蹦一下、
+弹个「我在这儿呢～」，然后自己退出。判断方式是占一个同名的 `QLocalServer`
+（`main.py` 里的 `SERVER_NAME`）—— 进程崩了名字会自动释放，比锁文件干净。
+
+起不来也不会闷声不响：会弹一个「塔菲起不来」的框，堆栈写进 `taffy.log`。
+pythonw 没有控制台，不这么做的话「双击没反应」什么线索都留不下。
+
 ## 操作
 
 | 动作 | 效果 |
@@ -151,6 +177,23 @@ taffy_pet/
 tools/
   build_assets.py        抠图 + 眼睛定位 + 闭眼帧
   extract_audio.py       从录屏提取音效
+  make_shortcut.py       生成图标 + 桌面快捷方式
   smoke.py               冒烟测试
   _blink_explore.py      闭眼帧的探索记录（含失败史）
 ```
+
+## 推到 GitHub
+
+`config.json` 在 `.gitignore` 里，**API Key 不会被提交**，历史上也从来没有过：
+
+```bash
+git log --all -p | grep -c 'sk-'        # → 0
+```
+
+clone 下来的人要自己配 Key（环境变量 `DEEPSEEK_API_KEY`，或者右键菜单里填）。
+
+两处本机相关的路径，别人 clone 下来要自己改：`tools/build_assets.py` 里的 `SRC`
+（原始立绘的绝对路径），以及 `tools/extract_audio.py` 的输入视频。
+
+仓库里带的是塔菲的同人立绘和从录屏里截的音效 —— 公开之前自己掂量一下。
+
