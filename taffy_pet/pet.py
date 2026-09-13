@@ -179,6 +179,7 @@ class PetWindow(QWidget):
     def build_menu(self) -> QMenu:
         """单独拆出来是为了能自动测 —— exec_() 会阻塞，没法在测试里直接调。"""
         m = QMenu(self)
+        m.addAction("和她说话", self.open_chat)
         m.addAction("设置 API Key", self.ask_api_key)
         m.addAction("刷新余额", self.refresh_balance)
 
@@ -215,6 +216,12 @@ class PetWindow(QWidget):
                             else flags & ~Qt.WindowStaysOnTopHint)
         self.show()
         cfgmod.save(self.cfg)
+
+    def open_chat(self) -> None:
+        if getattr(self, "chat", None) is None:
+            from .chat_window import ChatWindow
+            self.chat = ChatWindow(self.cfg)
+        self.chat.show_and_raise()
 
     def ask_api_key(self) -> None:
         cur = self.cfg.get("api_key", "")
