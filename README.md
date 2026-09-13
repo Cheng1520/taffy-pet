@@ -74,11 +74,14 @@ pythonw 没有控制台，不这么做的话「双击没反应」什么线索都
 素材已经生成好了，正常跑桌宠不需要这一步。改了原图才需要：
 
 ```bash
-python tools/build_assets.py
+python tools/build_assets.py <原图路径>
 ```
 
 从原始立绘产出 `assets/taffy.png`（抠图）、`assets/taffy_blink.png`（闭眼帧）、
 `assets/eyes.json`。
+
+**原图不在仓库里**（那是别人画的立绘，不好跟着分发），所以要自己把路径传进去。
+脚本收参数而不是写死常量，就是为了别人 clone 下来也能跑。
 
 音效来自录屏视频，重新提取：
 
@@ -192,8 +195,8 @@ git log --all -p | grep -c 'sk-'        # → 0
 
 clone 下来的人要自己配 Key（环境变量 `DEEPSEEK_API_KEY`，或者右键菜单里填）。
 
-两处本机相关的路径，别人 clone 下来要自己改：`tools/build_assets.py` 里的 `SRC`
-（原始立绘的绝对路径），以及 `tools/extract_audio.py` 的输入视频。
+原始立绘和录屏视频都不在仓库里，要重新生成素材就把路径从命令行传进去
+（`tools/build_assets.py` 和 `tools/extract_audio.py` 都是收参数的，没有写死的本机路径）。
 
 仓库里带的是塔菲的同人立绘和从录屏里截的音效 —— 公开之前自己掂量一下。
 

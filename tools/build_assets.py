@@ -1,11 +1,18 @@
 """从原始立绘构建桌宠素材。
 
-    python tools/build_assets.py
+用法：
+    python tools/build_assets.py <原图路径>
+
+例：
+    python tools/build_assets.py "C:/Users/me/Pictures/taffy_立绘.jpg"
 
 产出：
     assets/taffy.png        抠好的立绘（透明背景）
     assets/taffy_blink.png  闭眼帧（眨眼用）
     assets/eyes.json        眼睛区域坐标（眨眼动画用）
+
+原图（白底单张立绘）不跟着仓库走 —— 那是别人画的，我从能改的地方传进来。
+所以这里是参数而不是写死的常量：写死的话别人 clone 下来必定打不开。
 
 抠图判据说明（踩过坑之后定下来的）：
     不能用「到白色的距离」当判据 —— 浅粉头发 (251,183,184) 到白色的距离 ≈ 101，
@@ -16,6 +23,7 @@
 闭眼帧的生成见 tools/_blink_explore.py 顶部的失败记录，那里写了六版走过的弯路。
 """
 import json
+import sys
 from pathlib import Path
 
 import cv2
@@ -24,7 +32,6 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC = Path(r"C:/Users/king2/Desktop/Screenshots/微信图片_20260913173905_57_2.jpg")
 ASSETS = ROOT / "assets"
 
 # --- 抠图参数（已通过探针验证）---
@@ -46,8 +53,8 @@ LASH_Y_AT = 0.58     # 闭眼线在眼框内的垂直位置
 
 
 # ============================ 抠图 ============================
-def build_cutout() -> Image.Image:
-    im = Image.open(SRC).convert("RGB")
+def build_cutout(src: Path) -> Image.Image:
+    im = Image.open(src).convert("RGB")
     w, h = im.size
     im = im.crop((INSET, INSET, w - INSET, h - INSET))
     a = np.asarray(im).astype(np.int32)
@@ -239,11 +246,12 @@ def build_blink(img: Image.Image, irises, guard=(1.65, 1.75)) -> Image.Image:
 
 
 # ============================ 主流程 ============================
-def main() -> None:
+def main(src: Path) -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
 
+    print(f"原图：{src}")
     print("抠图...")
-    img = build_cutout()
+    img = build_cutout(src)
     print(f"  角色包围盒 {img.width}x{img.height}  宽高比 {img.width/img.height:.3f}")
 
     th = DISPLAY_HEIGHT * ASSET_SCALE
@@ -280,4 +288,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 2:
+        print(__doc__)
+        sys.exit(1)
+    src = Path(sys.argv[1])
+    if not src.exists():
+        sys.exit(f"找不到原图：{src}")
+    main(src)
