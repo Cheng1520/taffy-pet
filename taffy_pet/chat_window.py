@@ -17,40 +17,54 @@ from . import chat as chatmod
 from . import chat_store
 from . import config as cfgmod
 from .paths import ASSETS, PERSONA_DEFAULT, PERSONA_PATH
+# 配色只有这一个来源（计划的 Global Constraints）：气泡那四个常量直接引用 toast 的，
+# QSS 里的字面量也从它们拼出来。以前这里是手抄的一份，抄漏了两处 —— 窗口底色和系统
+# 提示文字跟 toast 已经对不上了，而「以后改桌宠配色聊天窗跟着变」这件事完全没保证。
+# 注意 toast.BG 带 α244（气泡是半透明的），聊天窗不需要半透明底，所以 .name() 取的是
+# 不带 α 的那个十六进制串；别用 HexArgb，那会把 244 一起带进来。
+from .toast import BG, BORDER, TEXT, DIM
 
 BUBBLE_R = 14          # 气泡圆角
 TAIL_W = 10            # 尾巴根部宽
 TAIL_H = 9             # 尾巴伸出高度
 PAD_X = 13             # 气泡内边距
 PAD_Y = 9
-HERS_BG = QColor(255, 255, 255)
-HERS_LINE = QColor(240, 190, 205)      # 跟 toast.py 的 BORDER 一致
-MINE_BG = QColor(228, 150, 175)
-MINE_LINE = QColor(221, 134, 163)
+HERS_BG = QColor(255, 255, 255)        # 她的气泡是实心白，跟 toast 的半透明底不是一回事
+HERS_LINE = BORDER                     # 气泡描边跟 toast 同一个来源
+MINE_BG = QColor(228, 150, 175)        # 用户气泡的粉底，toast 里没有对应物
+MINE_LINE = QColor(221, 134, 163)      # 它的描边
+BAR_BG = QColor(255, 246, 242)         # 底下那条输入区的底色
+BAR_LINE = QColor(246, 223, 230)       # 输入区上边线
+BTN_BUSY = QColor(185, 174, 180)       # 忙时按钮（灰掉，它现在是「停止」）
+BTN_BUSY_HOVER = QColor(169, 158, 164)
 
 AVATAR_H = 56          # 头像立绘的高度；宽度按原图比例走，不固定
 
-QSS = """
-#chatRoot, QScrollArea, #chatArea { background: #FFFBF8; }
-QScrollBar:vertical { background: transparent; width: 8px; margin: 4px 2px 4px 0; }
-QScrollBar::handle:vertical {
-    background: rgba(240, 190, 205, 150); border-radius: 4px; min-height: 30px;
-}
-QScrollBar::handle:vertical:hover { background: rgba(228, 150, 175, 210); }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-#chatInput {
-    background: #FFFFFF; border: 1.4px solid #F0BECD; border-radius: 12px;
-    padding: 6px 10px; color: #3A2E34;
-}
-#chatInput:focus { border: 1.4px solid #E496AF; }
-#sendBtn {
-    background: #E496AF; color: #FFFFFF; border: none; border-radius: 12px;
-}
-#sendBtn:hover { background: #DD86A3; }
-#sendBtn[busy="true"] { background: #B9AEB4; }
-#sendBtn[busy="true"]:hover { background: #A99EA4; }
-#chatBar { background: #FFF6F2; border-top: 1px solid #F6DFE6; }
+# QSS 里的 {} 是它自己的语法，写在这个 f-string 里得翻倍
+QSS = f"""
+#chatRoot, QScrollArea, #chatArea {{ background: {BG.name()}; }}
+QScrollBar:vertical {{ background: transparent; width: 8px; margin: 4px 2px 4px 0; }}
+QScrollBar::handle:vertical {{
+    background: rgba({BORDER.red()}, {BORDER.green()}, {BORDER.blue()}, 150);
+    border-radius: 4px; min-height: 30px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: rgba({MINE_BG.red()}, {MINE_BG.green()}, {MINE_BG.blue()}, 210);
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+#chatInput {{
+    background: #FFFFFF; border: 1.4px solid {BORDER.name()}; border-radius: 12px;
+    padding: 6px 10px; color: {TEXT.name()};
+}}
+#chatInput:focus {{ border: 1.4px solid {MINE_BG.name()}; }}
+#sendBtn {{
+    background: {MINE_BG.name()}; color: #FFFFFF; border: none; border-radius: 12px;
+}}
+#sendBtn:hover {{ background: {MINE_LINE.name()}; }}
+#sendBtn[busy="true"] {{ background: {BTN_BUSY.name()}; }}
+#sendBtn[busy="true"]:hover {{ background: {BTN_BUSY_HOVER.name()}; }}
+#chatBar {{ background: {BAR_BG.name()}; border-top: 1px solid {BAR_LINE.name()}; }}
 """
 
 _AVATAR = None         # 头像立绘的惰性缓存，见 _avatar_pixmap()
@@ -186,6 +200,9 @@ class ChatWindow(QWidget):
         self.pending = None          # 正在流式填充的那个气泡
         self.pending_text = ""       # 这一轮已经吐出来的字，_on_chunk 往里攒
         self.history = chat_store.load()
+        # 是不是「贴着底部」。新气泡长高之后要跟着滚，但用户自己往上翻的时候不能
+        # 把他拽下来 —— 跟随/不打扰两件事都挂在这一个标志上，见 _on_range_changed。
+        self._stick = True
 
         # 退出程序时必须把线程收掉，而窗口未必收得到 closeEvent：右键点塔菲 →「退出」
         # 走的是 PetWindow.quit() → QApplication.quit()，聊天窗从没 close() 过。
@@ -227,6 +244,11 @@ class ChatWindow(QWidget):
         self.scroll.setWidget(self.area)
         root.addWidget(self.scroll, 1)
 
+        # 跟随滚动挂在这儿，不是挂在 _on_chunk 里 —— 见 _on_range_changed 的注释
+        vbar = self.scroll.verticalScrollBar()
+        vbar.rangeChanged.connect(self._on_range_changed)
+        vbar.valueChanged.connect(self._on_value_changed)
+
         bar = QWidget()
         bar.setObjectName("chatBar")
         row = QHBoxLayout(bar)
@@ -255,20 +277,43 @@ class ChatWindow(QWidget):
         bar = self.scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
 
+    def _on_range_changed(self, _lo: int, hi: int) -> None:
+        """滚动范围一变就贴到底 —— 只要还在跟随。
+
+        必须在 rangeChanged 上做，不能像以前那样在 _on_chunk 里直接
+        `setValue(maximum())`：新气泡长高之后 Qt 的重排是**延迟**的，同一轮事件处理
+        里读到的 maximum() 还是旧值，那一滚等于没滚。更糟的是它自我击败 —— 滚完
+        value 还是旧的、max 已经涨上去了，下一次 _at_bottom() 从此恒为 False，
+        后面所有 chunk 再也不会滚（实测：12 块里 value 一动不动，差 172px）。
+        """
+        if self._stick:
+            self.scroll.verticalScrollBar().setValue(hi)
+
+    def _on_value_changed(self, _v: int) -> None:
+        """用户自己往上翻就走开，滚回底部就恢复跟随。
+
+        「不打扰往上翻」以前根本没实现：_on_chunk 里那个 stick 一旦失效就永远是
+        False，而 _append_widget 又是无条件滚的。
+        """
+        self._stick = self._at_bottom()
+
     def _add(self, widget) -> None:
         # 插在弹簧前面，否则新消息会跑到下面去
         self.msgs.insertWidget(self.msgs.count() - 1, widget)
 
-    def _apply_bubble_width(self) -> None:
-        """气泡最宽只占视口的 75%。
+    def _apply_width_to(self, bubble) -> None:
+        """只给这一个气泡设 75% 上限。
 
-        窗口可以缩放，写死像素必然错，所以按当前视口宽实时算。`resizeEvent` 和
-        `_append_widget` 各调一次 —— 只在 resizeEvent 里刷的话，窗口最后一次缩放
-        之后新产生的气泡拿的还是默认上限，长消息会直接顶满整行。
+        窗口可以缩放，写死像素必然错，所以按当前视口宽实时算。加一条气泡就全量刷
+        一遍的话是 O(n²)：回填 200 条历史时每条都要遍历一遍已经建出来的所有气泡，
+        实测开窗要 2 秒白屏（原生 5 秒）。新加的那条只需要它自己这一次。
         """
-        limit = int(self.scroll.viewport().width() * 0.75)
+        bubble.setMaximumWidth(int(self.scroll.viewport().width() * 0.75))
+
+    def _apply_bubble_width(self) -> None:
+        """全量刷一遍，只在 resizeEvent 里调 —— 窗口缩放之后所有气泡的上限都得跟着变。"""
         for b in self.area.findChildren(_Bubble):
-            b.setMaximumWidth(limit)
+            self._apply_width_to(b)
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
@@ -312,8 +357,9 @@ class ChatWindow(QWidget):
         bubble._outer = holder          # 中途要撤销的时候删的是这个，不是 bubble
         self._add(holder)
         # 新气泡也得吃到 75% 上限。只靠 resizeEvent 的话，窗口最后一次缩放之后
-        # 产生的气泡拿的是默认上限，长消息会超出去。
-        self._apply_bubble_width()
+        # 产生的气泡拿的是默认上限，长消息会超出去。只刷这一个 —— 全量刷一遍是
+        # O(n²)，见 _apply_width_to。
+        self._apply_width_to(bubble)
         QTimer.singleShot(0, self._scroll_to_bottom)
         return bubble
 
@@ -321,7 +367,7 @@ class ChatWindow(QWidget):
         lab = QLabel(text)
         lab.setAlignment(Qt.AlignCenter)
         lab.setWordWrap(True)
-        lab.setStyleSheet("color: #96848C; font-family: 'Microsoft YaHei UI';"
+        lab.setStyleSheet(f"color: {DIM.name()}; font-family: 'Microsoft YaHei UI';"
                           " font-size: 9.5pt; padding: 6px;")
         self._add(lab)
 
@@ -350,12 +396,11 @@ class ChatWindow(QWidget):
         self._set_busy(True)
 
     def _on_chunk(self, piece: str) -> None:
-        stick = self._at_bottom()
+        # 只管填字，滚动交给 _on_range_changed —— 气泡长高之后 rangeChanged 才带着
+        # 新算出来的 maximum 过来，在这儿读到的永远是旧值（Critical 1）。
         self.pending_text += piece
         if self.pending is not None:
             self.pending.set_text(self.pending_text)
-        if stick:
-            self._scroll_to_bottom()
 
     def _on_done(self, full: str) -> None:
         self.worker = None
@@ -415,12 +460,21 @@ class ChatWindow(QWidget):
             # stop() 只是置个标志位，要等下一块数据到了才退出循环；模型那边一停顿
             # 超过 3 秒就会走到这儿，长回复里很常见。
             print("[chat] 线程停在读上没收住，强杀")
+            # terminate() 是「可能把它变成卡住」而不是「一定能杀」：Windows 上它走
+            # TerminateThread，线程正握着 GIL 的时候连主线程一起锁死也是可能的。
+            # 所以下面那一步不是形式主义。
             self.worker.terminate()
             self.worker.wait(500)
             if self.worker.isRunning():
                 # 没杀干净就绝不能放手。线程还活着而引用丢了，窗口析构时 Qt 照样 abort
                 # （见 __init__ 里那段）。宁可把引用留着，等下一次收尾
                 # （关窗 / aboutToQuit）再试一次。
+                #
+                # 这一支在 Windows 上**实际走不到**：TerminateThread 是硬杀，随后的
+                # wait(500) 必定让 isRunning() 变 False（实测）。能走到它的是
+                # test_chat_window.py 里那个 _WedgedWorker 桩子。写了不是多余的：
+                # 「线程还活着而引用丢了」正是 C1 那条 abort 路，防御方向是对的，
+                # 别因为「反正跑不到」就删掉。
                 # 这一支**有意不调** _set_busy(False)：线程是真的卡住了，按钮停在
                 # 「停止」是诚实的；显示「发送」的话用户点下去会被 send() 里
                 # worker is not None 的守卫静默吞掉，界面反而在撒谎。别「顺手修掉」。
@@ -468,7 +522,9 @@ class ChatWindow(QWidget):
     def edit_persona(self) -> None:
         """把默认人设复制到用户目录再用系统默认程序打开。
 
-        （Task 6 之前的临时版：先只保证文件到位。）
+        用户目录里那份优先（`paths.persona_path()` 每次重判），所以改完切回来
+        下一句话就用上了 —— 不用重启。已经有一份就只打开、不覆盖，不然用户
+        自己写的人设会被随包的那份盖掉。
         """
         try:
             if not PERSONA_PATH.exists():
