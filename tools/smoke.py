@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import QApplication  # noqa: E402
 
 from taffy_pet import config as cfgmod  # noqa: E402
 from taffy_pet import anim as animmod  # noqa: E402
-from taffy_pet.pet import MARGIN, PetWindow  # noqa: E402
+from taffy_pet.pet import PetWindow  # noqa: E402
 
 
 def check_bounds(pet) -> bool:
@@ -23,8 +23,10 @@ def check_bounds(pet) -> bool:
 
     解析地算，不依赖渲染 —— 截图看不出「小了一点」是设计还是 bug。
     """
-    pw, ph = pet.pix.width(), pet.pix.height()
+    # 用实际绘制尺寸而不是资源像素 —— 资源是高分辨率的，和屏幕上的大小不是一回事
+    pw, ph = pet.disp_w, pet.disp_h
     win_w, win_h = pet.width(), pet.height()
+    M = pet.margin
     ok = True
 
     worst = {"left": float("inf"), "right": float("-inf"),
@@ -34,10 +36,10 @@ def check_bounds(pet) -> bool:
         # 锚点是底部中心；加上呼吸的最坏偏移
         sy += animmod.BREATH_AMP
         half = pw / 2.0 * sx
-        worst["left"] = min(worst["left"], MARGIN + pw / 2.0 - half)
-        worst["right"] = max(worst["right"], MARGIN + pw / 2.0 + half)
-        worst["top"] = min(worst["top"], MARGIN + ph - ph * sy + dy)
-        worst["bottom"] = max(worst["bottom"], MARGIN + ph + dy)
+        worst["left"] = min(worst["left"], M + pw / 2.0 - half)
+        worst["right"] = max(worst["right"], M + pw / 2.0 + half)
+        worst["top"] = min(worst["top"], M + ph - ph * sy + dy * ph)
+        worst["bottom"] = max(worst["bottom"], M + ph + dy * ph)
         lo_sy, hi_sy = min(lo_sy, sy), max(hi_sy, sy)
 
     if worst["left"] < 0 or worst["right"] > win_w:
@@ -49,7 +51,7 @@ def check_bounds(pet) -> bool:
     if ok:
         print(f"  ✓ 边界安全：x {worst['left']:.1f}..{worst['right']:.1f} / "
               f"y {worst['top']:.1f}..{worst['bottom']:.1f}"
-              f"（窗口 {win_w}x{win_h}，边距 {MARGIN}）")
+              f"（窗口 {win_w}x{win_h}，边距 {M:.1f}）")
 
     # 幅度太小就等于没动画。压扁 5% 起步，肉眼才看得出。
     squash = 1.0 - lo_sy

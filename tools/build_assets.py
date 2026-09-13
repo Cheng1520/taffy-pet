@@ -32,8 +32,12 @@ INSET = 8         # 裁掉外圈深灰边框
 CHROMA_MAX = 14   # 彩度低于此值 = 无彩色（白底/灰噪声/投影）
 BRIGHT_MIN = 170  # 亮度高于此值 = 亮（投影灰 193 会被清掉）
 
-DISPLAY_HEIGHT = 380   # 屏幕上的显示高度
-ASSET_SCALE = 2        # 素材按 2 倍存，缩放时更清晰
+# 素材分辨率按「默认显示高度 × 4」存：
+#   2 倍是给高 DPI 屏的（200% 缩放下 1 逻辑像素 = 2 物理像素），
+#   再留一倍余量，这样用户把 config.json 的 height 调大也不会糊。
+# 桌宠实际画多大由 pet.py 按 height 缩放，跟这里的像素数没关系。
+DISPLAY_HEIGHT = 200
+ASSET_SCALE = 4
 
 # --- 闭眼帧参数 ---
 LASH_THICK = 0.16    # 睫毛线宽 / 眼高

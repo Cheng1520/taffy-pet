@@ -5,7 +5,7 @@
 """
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QPoint, QRectF, QTimer
+from PyQt5.QtCore import Qt, QRectF, QTimer
 from PyQt5.QtGui import QPainter, QPixmap
 from PyQt5.QtWidgets import QApplication, QInputDialog, QLineEdit, QMenu, QWidget
 
@@ -17,10 +17,14 @@ from .toast import Toast
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "assets"
 
-# 预留放大/弹跳的余量。呼吸(+0.8%)叠上弹跳拉伸(+3.0%)，760px 上最高长出约 29px，
-# 再加腾空 12px，42 够用。小了呆毛会在弹起那几帧被窗口顶边裁掉；
-# 但这个边距同时也是窗口挡桌面图标的面，所以别随手加大。
-MARGIN = 42
+# 边距是角色显示高度的比例，不是固定像素 —— 角色的放大/弹跳都是按比例缩放的，
+# 固定边距在角色调小之后会显得过大、调大之后又不够。
+#
+# 这个比例的来历：呼吸(+0.8%) 叠上弹跳拉伸(+3.0%) 是 3.8%，再加腾空（anim.py 的
+# HOP，1.6%），合起来 5.4%，留到 6.5% 有余量。小了呆毛会在弹起那几帧被窗口顶边
+# 裁掉；但这个边距同时也是窗口挡住周围桌面图标的面，所以别随手加大。
+# tools/smoke.py 会走完整条弹跳曲线来验这个余量够不够。
+MARGIN_RATIO = 0.065
 CLICK_SLOP = 6       # 位移小于这个像素数还算点击
 CLICK_MS = 500       # 按下超过这么久算长按，不算点击
 
@@ -45,7 +49,17 @@ class PetWindow(QWidget):
             raise SystemExit("assets/taffy.png 不存在，先跑 python tools/build_assets.py")
 
         self.setWindowOpacity(float(cfg.get("opacity", 1.0)))
-        self.resize(self.pix.width() + MARGIN * 2, self.pix.height() + MARGIN * 2)
+
+        # 目标显示高度是「逻辑像素」。资源本身是高分辨率（见 build_assets.py），
+        # 这里按比例缩到 height 逻辑像素 —— 高 DPI 屏上会自动铺满对应的物理像素。
+        #
+        # 之前这里直接 1:1 把资源画出去，结果 200% 缩放的屏上角色占了整屏 95% 高度，
+        # 头被顶到屏幕外，看着像「不在桌面上」。
+        self.disp_h = max(40.0, float(cfg.get("height", 200)))
+        self.disp_w = self.pix.width() * self.disp_h / self.pix.height()
+        self.margin = max(6.0, self.disp_h * MARGIN_RATIO)
+        self.resize(int(round(self.disp_w + self.margin * 2)),
+                    int(round(self.disp_h + self.margin * 2)))
 
         self.toast = Toast()
         self.fetcher = None
@@ -87,11 +101,21 @@ class PetWindow(QWidget):
         pos = self.cfg.get("pos")
         screen = QApplication.primaryScreen().availableGeometry()
         if isinstance(pos, (list, tuple)) and len(pos) == 2:
-            x, y = int(pos[0]), int(pos[1])
-            if screen.intersects(QRectF(x, y, self.width(), self.height()).toRect()):
-                self.move(x, y)
-                return
-        self.move(screen.right() - self.width() - 60, screen.bottom() - self.height() - 10)
+            x, y = self._clamp(int(pos[0]), int(pos[1]), screen)
+            self.move(x, y)
+            return
+        # 默认落在右下角，但要夹在屏幕内 —— 算出来是负坐标时角色会被顶到屏幕外，
+        # 看着就像「没启动」。
+        self.move(*self._clamp(screen.right() - self.width() - 60,
+                               screen.bottom() - self.height() - 10, screen))
+
+    def _clamp(self, x: int, y: int, screen) -> tuple:
+        """保证窗口至少有相当一部分留在屏幕内，别整只跑到屏幕外面去。"""
+        x = max(screen.left() - self.width() // 3,
+                min(x, screen.right() - self.width() * 2 // 3))
+        y = max(screen.top() - self.height() // 3,
+                min(y, screen.bottom() - self.height() * 2 // 3))
+        return x, y
 
     # ---------- 绘制 ----------
     def paintEvent(self, _event) -> None:
@@ -101,10 +125,11 @@ class PetWindow(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         w, h = self.width(), self.height()
-        p.translate(w / 2.0, h - MARGIN)      # 锚点：底部中心
+        m = self.margin
+        p.translate(w / 2.0, h - m)           # 锚点：底部中心
         p.scale(sx, sy)
-        p.translate(-w / 2.0, -(h - MARGIN) + dy)
-        p.drawPixmap(MARGIN, MARGIN, src)
+        p.translate(-w / 2.0, -(h - m) + dy * self.disp_h)
+        p.drawPixmap(QRectF(m, m, self.disp_w, self.disp_h), src, QRectF(src.rect()))
 
     # ---------- 交互 ----------
     def mousePressEvent(self, e) -> None:

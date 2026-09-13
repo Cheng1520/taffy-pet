@@ -16,7 +16,10 @@ ENV_KEY = "DEEPSEEK_API_KEY"
 
 DEFAULTS = {
     "api_key": "",
-    "height": 380,          # 角色在屏幕上的高度（像素）
+    # 角色在屏幕上的高度，单位是「逻辑像素」：和 Qt 的窗口坐标同一套单位，
+    # 会跟着 Windows 的缩放比例走。200% 缩放的屏上，200 逻辑像素 = 400 物理像素。
+    # 想让她更大/更小就改这个数。
+    "height": 200,
     "opacity": 1.0,
     "always_on_top": True,
     "blink": True,

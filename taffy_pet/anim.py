@@ -21,7 +21,11 @@ BREATH_AMP = 0.008       # 纵向起伏幅度
 BREATH_WIDE = 0.45       # 横向反向幅度（大致保持体积不变）
 
 BOUNCE_MS = 620          # 一次点击弹跳的总时长
-HOP_PX = 12              # 腾空高度（像素）
+HOP = 0.016              # 腾空高度，占角色高度的比例
+
+# 这里所有量都是比例，没有写死的像素 —— 角色显示大小由 config 的 height 决定，
+# 换个尺寸就得让动画跟着等比缩放。之前 HOP 是写死的 12px，角色从 760px 缩到
+# 200px 之后这一跳相对高度翻了三倍，呆毛直接被窗口顶边裁掉。
 
 # (进度, 纵向缩放, 横向缩放, 离地比例)
 # 先压扁 -> 蹬地窜起并拉长 -> 滞空 -> 落地压回 -> 复位
@@ -63,7 +67,7 @@ def bounce_curve(steps: int = 400):
     out = []
     for i in range(steps + 1):
         sy, sx, lift = _sample(i / steps)
-        out.append((sx, sy, -lift * HOP_PX))
+        out.append((sx, sy, -lift * HOP))
     return out
 
 
@@ -133,7 +137,10 @@ class PetAnimator(QObject):
 
     # ---------- 给窗口取用 ----------
     def state(self):
-        """返回 (横向缩放, 纵向缩放, 纵向位移, 是否闭眼)。"""
+        """返回 (横向缩放, 纵向缩放, 纵向位移比例, 是否闭眼)。
+
+        位移是「占角色高度的比例」而不是像素 —— 角色显示大小可配，像素量会跟着变。
+        """
         breath = math.sin(self._t * 2 * math.pi / BREATH_PERIOD)
         sy = sx = 1.0
         dy = 0.0
