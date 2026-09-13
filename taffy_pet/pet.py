@@ -160,6 +160,16 @@ class PetWindow(QWidget):
         if was_click:
             self.on_click()
 
+    def mouseDoubleClickEvent(self, e) -> None:
+        """双击她 = 找她说话。只认左键：右键双击是菜单那一路，不该顺手弹出窗口。
+
+        已知瑕疵：第一下已经把 mouseReleaseEvent 的单击逻辑走完了，所以窗口开出来
+        之前她会先弹一句气泡、查一次余额。要消掉只能给每次单击加 250ms 延迟等第二下
+        落空，那更烦 —— 单击是她最主要的交互。接受。
+        """
+        if e.button() == Qt.LeftButton:
+            self.open_chat()
+
     def show_hint_if_first_run(self) -> None:
         """透明窗口没有任何可见的边框，不提示的话没人知道能右键、能拖。"""
         if self.cfg.get("hint_shown"):
@@ -180,8 +190,12 @@ class PetWindow(QWidget):
         """单独拆出来是为了能自动测 —— exec_() 会阻塞，没法在测试里直接调。"""
         m = QMenu(self)
         m.addAction("和她说话", self.open_chat)
+        m.addAction("编辑人设", self.edit_persona)
+        m.addSeparator()
         m.addAction("设置 API Key", self.ask_api_key)
         m.addAction("刷新余额", self.refresh_balance)
+        m.addAction("清空对话记录", self.clear_chat)
+        m.addSeparator()
 
         blink = m.addAction("眨眼")
         blink.setCheckable(True)
@@ -218,10 +232,20 @@ class PetWindow(QWidget):
         cfgmod.save(self.cfg)
 
     def open_chat(self) -> None:
+        """已经开着就叫到前面，不要再开一个。"""
         if getattr(self, "chat", None) is None:
             from .chat_window import ChatWindow
             self.chat = ChatWindow(self.cfg)
         self.chat.show_and_raise()
+
+    def edit_persona(self) -> None:
+        """先把窗开出来再编辑 —— 在记事本里改完切回来就能直接接着说。"""
+        self.open_chat()
+        self.chat.edit_persona()
+
+    def clear_chat(self) -> None:
+        self.open_chat()
+        self.chat.clear_history()
 
     def ask_api_key(self) -> None:
         cur = self.cfg.get("api_key", "")
@@ -257,10 +281,32 @@ class PetWindow(QWidget):
     def _remember_pos(self) -> None:
         self.cfg["pos"] = [self.x(), self.y()]
 
+    def _close_chat(self) -> None:
+        """退出前把聊天窗收掉，否则那个 QThread 还挂在网络上。
+
+        必须是带守卫的版本，别改成无条件 `self.chat = None`：`close()` 是同步走完
+        closeEvent → `_stop_worker()` 的，而那里面有一支**有意**留着 worker 不放
+        （线程卡在网络上、强杀也没杀掉，那儿有注释）。这时候把窗口的最后一个 Python
+        引用丢掉，窗口就会析构，而 ChatWorker 是它的 Qt 子对象 —— QThread 析构时线程
+        还在跑，Qt 直接 qFatal → abort(0xC0000409)。这正是 Task 5 复审抓出的 C1，
+        而且 aboutToQuit 救不了：崩在 _close_chat() 里面，根本走不到 QApplication.quit()。
+        """
+        chat = getattr(self, "chat", None)
+        if chat is None:
+            return
+        chat.close()
+        if chat.worker is None:
+            self.chat = None
+
     def quit(self) -> None:
         self._remember_pos()
         cfgmod.save(self.cfg)
         self.animator.stop()
+        # 这一句在 cfgmod.save **之后**，所以 chat_geometry 不是上面那次存下来的，而是
+        # 下面 close() 里 ChatWindow.closeEvent 自己那次 save 存的 —— 两处 save 各管
+        # 各的，别为了「只存一次」把顺序理顺：closeEvent 里那次是「用户只关聊天窗、
+        # 不退出程序」时唯一的落盘点，删掉它几何就丢了。
+        self._close_chat()
         self.toast.hide()
         QApplication.quit()
 
@@ -268,5 +314,6 @@ class PetWindow(QWidget):
         self._remember_pos()
         cfgmod.save(self.cfg)
         self.animator.stop()
+        self._close_chat()
         self.toast.close()
         super().closeEvent(e)

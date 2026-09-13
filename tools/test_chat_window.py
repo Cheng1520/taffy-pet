@@ -46,7 +46,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 # 顺便还能白拿它模块级设的 NO_PROXY（绕开本机系统代理对 127.0.0.1 的劫持）。
 import test_chat as TC                                  # noqa: E402
 
-from PyQt5.QtCore import Qt, QEventLoop, QTimer         # noqa: E402
+from PyQt5.QtCore import Qt, QEvent, QEventLoop, QPointF, QTimer   # noqa: E402
+from PyQt5.QtGui import QMouseEvent                     # noqa: E402
 from PyQt5.QtWidgets import QApplication, QMessageBox   # noqa: E402
 
 from taffy_pet import chat as CH                        # noqa: E402
@@ -161,6 +162,21 @@ def run_case(fn) -> None:
 
 def new_window(cfg: dict):
     return CW.ChatWindow(cfg)
+
+
+def new_pet():
+    """建一只塔菲主窗口，建不起来就记一笔失败、返回 None（调用方 `if pet is None: return`）。
+
+    缺素材时 PetWindow 抛的是 SystemExit，它继承 BaseException 而不是 Exception ——
+    只接 Exception 的话整个测试进程会当场退出，后面所有用例连跑都跑不到。
+    用例本来也不多，这儿直接把「建不起来」记成失败，不搞 skip 那一套。
+    """
+    from taffy_pet.pet import PetWindow                # 只有主窗口这几个用例要它
+    try:
+        return PetWindow(cfgmod.load())
+    except BaseException as e:                          # noqa: BLE001
+        ck("塔菲主窗口建得起来", f"{type(e).__name__}: {e}", None)
+        return None
 
 
 # ---------- 用例 ----------
@@ -638,29 +654,204 @@ def case_titlebar() -> None:
 
 
 def case_menu_entry() -> None:
-    """pet.py 的那个临时入口：连点两次只开一个窗口（brief Step 3 的第 4 条）。
+    """pet.py 的入口：三项菜单都在，连点两次只开一个窗口（brief Step 3 的第 4 条）。
 
-    没有 ChatWindow 之外的入口能测到 pet.py 那两行接线，所以顺手在这儿守一下 ——
+    没有 ChatWindow 之外的入口能测到 pet.py 那几行接线，所以顺手在这儿守一下 ——
     不然「和她说话」写错了要等真跑起来才发现。
     """
-    print("菜单入口「和她说话」：")
-    from taffy_pet.pet import PetWindow                # 只这一个用例要它，懒得放文件头
-    try:
-        pet = PetWindow(cfgmod.load())
-    except BaseException as e:                          # 缺素材时抛的是 SystemExit
-        ck("塔菲主窗口建得起来", f"{type(e).__name__}: {e}", None)
+    print("菜单入口：")
+    pet = new_pet()
+    if pet is None:
         return
     try:
-        ck("菜单里有「和她说话」",
-           "和她说话" in [a.text() for a in pet.build_menu().actions()], True)
+        items = [a.text() for a in pet.build_menu().actions()]
+        ck("菜单里有「和她说话」「编辑人设」「清空对话记录」",
+           [t for t in ("和她说话", "编辑人设", "清空对话记录") if t in items],
+           ["和她说话", "编辑人设", "清空对话记录"])
         pet.open_chat()
         first = pet.chat
         ck("开出来的是聊天窗口", type(first).__name__, "ChatWindow")
         pet.open_chat()                                 # 再点一次
         ck("连点两次只有一个窗口", pet.chat is first, True)
+
+        # 「清空对话记录」光查菜单里有没有这几个字还不够 —— addAction 的第二个参数
+        # 接错了方法照样是绿的，得真走一遍 pet → chat。确认框打桩成「是」（真弹窗会
+        # 挂住；这里清的是隔离出来的临时目录，动不到用户的聊天记录）。
+        # 「编辑人设」不在这儿调：它最后走 QDesktopServices 弹系统程序，会把记事本
+        # 真的开到用户桌面上，不是测试该干的事，那条留给手动验证。
+        first.history = [chat_store.make("user", "随便一句")]
+        chat_store.save(first.history)
+        real_question = QMessageBox.question
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+        try:
+            pet.clear_chat()
+        finally:
+            QMessageBox.question = real_question
+        ck("「清空对话记录」真的走到聊天窗口里去了", first.history, [])
+        ck("盘里也清了", chat_store.load(), [])
+
         first.close()                                   # closeEvent 也只写临时目录
     finally:
         pet.close()
+
+
+def case_double_click() -> None:
+    """双击她 = 开聊天窗，右键双击不开（brief Step 2 的双击入口）。
+
+    直接造 QMouseEvent 调进去，不 show() —— 造事件不需要窗口显示，也就不会往桌面上
+    放第二只塔菲（用户那只正在跑）。五参构造（QPointF 那版）在本机实测可用。
+    """
+    print("双击开窗：")
+    pet = new_pet()
+    if pet is None:
+        return
+    try:
+        def dbl(button):
+            return QMouseEvent(QEvent.MouseButtonDblClick, QPointF(5.0, 5.0),
+                               button, button, Qt.NoModifier)
+        ck("一开始没开窗", getattr(pet, "chat", None), None)
+        # 右键那条必须先验。倒过来写（先左键、后右键）的话，第二步会撞上「已经开着
+        # 就不再开」的守卫，无论 mouseDoubleClickEvent 判不判 button 都会绿 —— 一条
+        # 永远正确的假断言。
+        pet.mouseDoubleClickEvent(dbl(Qt.RightButton))
+        ck("右键双击不开窗", getattr(pet, "chat", None), None)
+        pet.mouseDoubleClickEvent(dbl(Qt.LeftButton))
+        ck("左键双击开了聊天窗", type(getattr(pet, "chat", None)).__name__, "ChatWindow")
+    finally:
+        pet.close()
+
+
+def case_quit_clears_chat() -> None:
+    """右键 →「退出」之后不能再攥着聊天窗（线程要跟着收干净）。
+
+    直接在本进程调 quit()：里面那句 QApplication.quit() 在没有 exec_ 的事件循环上
+    是空操作（Qt 文档原话：事件循环没在跑就什么都不做），不会把这个进程带走。子进程
+    那条路（真跑 exec_ 的）已经是 case_quit_while_streaming 在守了。
+    """
+    print("退出时收掉聊天窗：")
+    pet = new_pet()
+    if pet is None:
+        return
+    try:
+        pet.open_chat()
+        ck("先确认窗真的开着", type(getattr(pet, "chat", None)).__name__, "ChatWindow")
+        pet.quit()
+        ck("退出后不再攥着聊天窗", getattr(pet, "chat", None), None)
+    finally:
+        pet.close()
+
+
+def case_close_chat_wedged() -> None:
+    """白盒：强杀不掉时 _close_chat 绝不能把 chat 置 None。
+
+    这一支在真机上**走不到** —— Windows 的 terminate() 走 TerminateThread，
+    wait(500) 回来 isRunning() 稳定是 False（Task 5 跑 C1 探针时实测过）。所以跟
+    case_wedged_worker_keeps_ref 一个套路：把 worker 整体换成一个杀不掉的鸭子类型
+    对象（真的 QThread 上覆盖不了 wait/isRunning，那些是 sip 生成的槽），直接验
+    _close_chat 里那个 `if chat.worker is None` 守卫本身。
+
+    没有守卫会怎样：chat.close() 是同步走完 closeEvent → _stop_worker 的，而那一支
+    **有意**留着 self.worker 不置 None（线程还卡在网络上）；紧接着 `self.chat = None`
+    就丢掉了 ChatWindow 的最后一个 Python 引用 → 窗口析构 → ChatWorker 是它的 Qt
+    子对象跟着析构 → QThread 析构时线程还在跑 → qFatal → abort 0xC0000409。这正是
+    Task 5 复审抓出的 C1，而 aboutToQuit 救不了：崩在 _close_chat() 里面，根本走不到
+    QApplication.quit()。
+    """
+    print("兜底：强杀不掉时退出不能丢聊天窗引用：")
+    pet = new_pet()
+    if pet is None:
+        return
+    try:
+        pet.open_chat()
+        win = pet.chat
+        stub = _WedgedWorker()
+        win.worker = stub
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):           # 不动产品代码，只在外面接 print
+            pet._close_chat()
+
+        ck("强杀确实试过了", stub.terminate_called, True)
+        # 最要紧的一条。丢了它，窗口析构时 Qt 直接 abort(0xC0000409)，pythonw 下用户
+        # 只看到程序凭空消失，什么线索都没有。
+        ck("线程还活着时没把 chat 丢掉", pet.chat is win, True)
+
+        # 反面：线程真收干净了（worker is None）就必须放手 —— 不然「干脆一直攥着」
+        # 也能过上面那条，等于没测。
+        win.worker = None
+        pet._close_chat()
+        ck("线程收干净了就放手", getattr(pet, "chat", None), None)
+    finally:
+        # 桩没法真的收尾，摘掉再关窗，别让它挂到窗口析构那一刻
+        if getattr(pet, "chat", None) is not None:
+            pet.chat.worker = None
+        pet.close()
+
+
+def case_config_geometry_roundtrip() -> None:
+    """chat_geometry 存得下来，也要读得回来。
+
+    这条守的是 config.load() 里那句 `if k in DEFAULTS` 过滤：DEFAULTS 里漏了这一项
+    的话，ChatWindow 每次关窗都老老实实把它写进文件，读的时候却被悄悄丢掉 —— 表现
+    是「窗口位置和大小永远记不住」，而盘里明明躺着那个数，查起来很费劲。
+    """
+    print("配置里的窗口几何：")
+    cfg = dict(cfgmod.DEFAULTS)
+    cfg["chat_geometry"] = [120, 80, 420, 560]
+    cfgmod.save(cfg)
+    back = cfgmod.load()
+    ck("存下来的几何读得回来", back.get("chat_geometry"), [120, 80, 420, 560])
+    ck("在 DEFAULTS 里（load 的过滤才留得住它）", "chat_geometry" in cfgmod.DEFAULTS, True)
+
+
+def case_config_atomic_save() -> None:
+    """config.save() 必须是原子写：不留 .tmp，替换失败时不能把原文件弄坏。
+
+    不是「好看」而已：这份配置里有 API Key，非原子写正好在写到一半时被杀/断电，
+    文件就废了 —— 表现是「每次启动 Key 都变空」，用户一点线索都没有。chat_store
+    早就这么写了，config 跟着它一个形状。
+    """
+    print("配置原子写：")
+    p = cfgmod.CONFIG_PATH
+    tmp = p.parent / (p.name + ".tmp")
+    cfg = dict(cfgmod.DEFAULTS)
+    cfg["height"] = 200
+    cfgmod.save(cfg)
+    ck("存完之后没留下 .tmp", tmp.exists(), False)
+    ck("存进去的读得回来", cfgmod.load()["height"], 200)
+
+    # 替换失败：磁盘满、杀软锁住目标、文件被别的程序占用都会这样。打桩的是 os.replace
+    # 本身，所以非原子写（直接 write_text 覆盖目标）在这条下会当场露馅 —— 目标文件已经
+    # 被新内容覆盖掉一半了。断言的就是「宁可这次没存上，也不能把上一次存好的弄坏」。
+    before = p.read_text(encoding="utf-8")
+    real_replace = os.replace
+
+    def boom(*a, **k):
+        raise OSError("打桩：替换这一步失败")
+
+    os.replace = boom                 # config.save() 里用的就是 os.replace
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):           # 这一笔失败是故意的，别刷到屏幕上
+            cfgmod.save({**cfg, "height": 999})
+    finally:
+        os.replace = real_replace
+    # 比整份文本而不是只看 height：后者过得去、文件却可能已经被写坏成半截
+    ck("原文件一字没变", p.read_text(encoding="utf-8") == before, True)
+    ck("读回来还是老值", cfgmod.load()["height"], 200)
+    # 失败必须留下痕迹：静默吞掉的写失败，用户只会看到「Key 又没了」而查不出原因
+    ck("打了一行「存不了」的日志", "存不了 config.json" in buf.getvalue(), True)
+
+
+def case_avatar_cached() -> None:
+    """头像立绘只解码一次（Task 6 留下的惰性缓存，之前没有任何断言守着它）。
+
+    回填 200 条历史时 _append_widget 要走 100 次，去掉缓存就是每次从磁盘解码一张
+    369×800 的图再缩放 —— 开窗时肉眼可见的卡顿。这里必须用身份比较：把缓存去掉
+    之后每次 new 一个 QPixmap，尺寸当然还是一样的，「宽高相同」那种断言照样绿。
+    """
+    print("头像立绘缓存：")
+    ck("两次拿到的是同一个对象", CW._avatar_pixmap() is CW._avatar_pixmap(), True)
 
 
 def case_quit_while_streaming() -> None:
@@ -812,6 +1003,12 @@ def main() -> int:
         run_case(case_titlebar)
         run_case(case_quit_while_streaming)
         run_case(case_menu_entry)
+        run_case(case_double_click)
+        run_case(case_quit_clears_chat)
+        run_case(case_close_chat_wedged)
+        run_case(case_config_geometry_roundtrip)
+        run_case(case_config_atomic_save)
+        run_case(case_avatar_cached)
     finally:
         srv.shutdown()
         shutil.rmtree(tmp, ignore_errors=True)
