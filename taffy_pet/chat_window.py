@@ -115,8 +115,11 @@ class _Bubble(QWidget):
         self._label.setWordWrap(True)
         self._label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self._label.setFont(QFont("Microsoft YaHei UI", 10))
+        # 她的气泡文字跟 toast 同一个来源（这条 inline stylesheet 独立于模块级 QSS，
+        # 手抄一份的话「改桌宠配色聊天窗跟着变」就又断在这儿）。白字那半边没有对应物：
+        # 粉底上的白字 toast 里不存在，写死。
         self._label.setStyleSheet(
-            f"color: {'#FFFFFF' if mine else '#3A2E34'}; background: transparent;")
+            f"color: {'#FFFFFF' if mine else TEXT.name()}; background: transparent;")
 
         lay = QVBoxLayout(self)
         left = PAD_X if mine else PAD_X + TAIL_W

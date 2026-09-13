@@ -659,6 +659,21 @@ def case_bubbles_painted() -> None:
        f"rgba({CW.BORDER.red()}, {CW.BORDER.green()}, {CW.BORDER.blue()}, 150)" in CW.QSS,
        True)
     ck("输入框文字用的是 toast.TEXT", CW.TEXT.name() in CW.QSS, True)
+    # 气泡文字是**另一条** inline stylesheet（在 _Bubble.__init__ 里，不在模块级
+    # QSS 里），上面那条查 QSS 的看不见它 —— `#3A2E34` 就是手抄在那儿的。
+    # 查值没用：手抄一份值一模一样的，比字符串照样绿。只有把来源换掉才知道它跟不跟。
+    real_text = CW.TEXT
+    CW.TEXT = CW.QColor(1, 2, 3)           # 换一个正常不可能撞上的颜色
+    try:
+        follows = win._append_widget("换个颜色再看", False)._label.styleSheet()
+        white = win._append_widget("白字那条不跟", True)._label.styleSheet()
+    finally:
+        CW.TEXT = real_text
+    ck("换掉 toast.TEXT，气泡文字跟着换（换不动的就是手抄的）",
+       "#010203" in follows, True)
+    # 反面：我的气泡是粉底白字，跟 TEXT 无关 —— 没有这条的话「两边都吐 TEXT」
+    # 也能过上面那条，等于没测。
+    ck("我的气泡是白字，不跟着 TEXT 走", "#010203" in white, False)
     ck("气泡描边常量就是 toast.BORDER", CW.HERS_LINE.rgb(), CW.BORDER.rgb())
     win._append_notice("测试用的提示")
     # _add() 是插在末尾那个弹簧**前面**的，所以提示在 count()-2，末尾还是弹簧
