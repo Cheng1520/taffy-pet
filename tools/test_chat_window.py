@@ -147,8 +147,41 @@ def reset_handler() -> None:
     TC.Handler.seen = {}
 
 
+_OPEN_WINDOWS = []      # new_window() 建出来的窗口，run_case 收尾时统一收掉
+
+
+def _reap_windows() -> None:
+    """把这个用例留下来的聊天窗收干净：close + 等线程。
+
+    不这么做的话，「用例自己断言失败 → 提前 return → 留下一个 worker 还在跑的
+    窗口」会让下一个用例的 QApplication 活动把它带走：窗口析构 → QThread 析构时
+    线程还在跑 → Qt 直接 qFatal → abort(0xC0000409)。那是**进程级**的，Python 里
+    接不住，表现是整条套件无声退出、一条 FAIL 都留不下来（实测：让 chat_store.save
+    不落盘那个变异体的退出码是 3221226505，后面所有用例一个都没跑，人也只看到一个
+    裸的错误码）。诊断信息比失败本身重要，所以每个用例都做这一步。
+
+    登记表不是为了好看：用例里那个局部变量 `win` 出了函数就没引用了，窗口可能
+    在这一步之前就已经析构，那时再去遍历 topLevelWidgets 已经找不到它 —— 先攥着
+    引用、再收，才有得收。
+    """
+    windows = list(_OPEN_WINDOWS)
+    for w in QApplication.topLevelWidgets():        # 绕过 new_window 建的也一并收
+        if isinstance(w, CW.ChatWindow) and w not in windows:
+            windows.append(w)
+    for w in windows:
+        try:
+            w.close()                               # closeEvent → _stop_worker
+        except Exception:                           # noqa: BLE001  收尾不能再抛出去
+            import traceback
+            traceback.print_exc()
+        worker = getattr(w, "worker", None)
+        if worker is not None:
+            worker.wait(3000)
+    _OPEN_WINDOWS.clear()
+
+
 def run_case(fn) -> None:
-    """一个用例崩了别把后面的都带下水：记一笔，重置假接口，接着跑。"""
+    """一个用例崩了别把后面的都带下水：记一笔，重置假接口，把窗口收掉，接着跑。"""
     reset_handler()                 # 上一个用例改过的类属性不能留到这一个
     try:
         fn()
@@ -158,10 +191,13 @@ def run_case(fn) -> None:
         ck(f"{fn.__name__} 不该抛异常", f"{type(e).__name__}: {e}", None)
     finally:
         reset_handler()
+        _reap_windows()
 
 
 def new_window(cfg: dict):
-    return CW.ChatWindow(cfg)
+    win = CW.ChatWindow(cfg)
+    _OPEN_WINDOWS.append(win)
+    return win
 
 
 def new_pet():
@@ -613,7 +649,149 @@ def case_bubbles_painted() -> None:
     avatar = hers._outer.layout().itemAt(0).widget()
     ck("头像控件的宽度就是立绘的宽度（右边不留空）", avatar.width(), pm.width())
     ck("头像控件的高度就是立绘的高度", avatar.height(), pm.height())
+
+    # 5：配色只有一个来源（计划的 Global Constraints：「沿用 toast.py 已有的
+    # BG / BORDER / TEXT / DIM，不要另起一套」）。这儿查的是 QSS 里那串值确实是从
+    # toast 拼出来的 —— 手抄一份的话这几条会红，而手抄的那份已经抄错过两处
+    # （窗口底色 vs BG、系统提示 vs DIM），改桌宠配色聊天窗也不会跟着变。
+    ck("窗口底色用的是 toast.BG", CW.BG.name() in CW.QSS, True)
+    ck("描边用的是 toast.BORDER",
+       f"rgba({CW.BORDER.red()}, {CW.BORDER.green()}, {CW.BORDER.blue()}, 150)" in CW.QSS,
+       True)
+    ck("输入框文字用的是 toast.TEXT", CW.TEXT.name() in CW.QSS, True)
+    ck("气泡描边常量就是 toast.BORDER", CW.HERS_LINE.rgb(), CW.BORDER.rgb())
+    win._append_notice("测试用的提示")
+    # _add() 是插在末尾那个弹簧**前面**的，所以提示在 count()-2，末尾还是弹簧
+    notice = win.msgs.itemAt(win.msgs.count() - 2).widget()
+    ck("系统提示文字用的是 toast.DIM", CW.DIM.name() in notice.styleSheet(), True)
     win.close()
+
+
+def case_stream_follows_scroll() -> None:
+    """Critical 1：聊天窗要跟着流式回复往下滚，但用户往上翻的时候不能拽他。
+
+    这一条以前完全没有覆盖（三套测试里 value / maximum 一次都没出现过），所以
+    「她一回话就滚不下去」这个主路径缺陷一路绿灯走到了终审。实测的旧行为：
+    用户明明在底部，第一块 chunk 滚到的却是**旧的** maximum（Qt 的重排是延迟的），
+    滚完 value 没动而 max 涨上去了，于是 _at_bottom() 从此恒为 False，后面 11 块
+    再也没滚过 —— 不是「滚不到位」，是「滚一次就永久放弃」。
+    """
+    print("流式回复跟随滚动：")
+    chat_store.clear()
+    # 历史必须超过一屏，否则滚不滚都看不出区别（这一条是整条用例的前提）
+    chat_store.save([chat_store.make("user" if i % 2 == 0 else "assistant",
+                                     f"第 {i} 条，写长一点点好占满一整行喵")
+                     for i in range(40)])
+    win = new_window({"api_key": "sk-test"})
+    win.resize(420, 560)
+    win.show()          # 要真布局过一遍，滚动范围才是真的
+    pump(300)
+
+    bar = win.scroll.verticalScrollBar()
+    ck("历史够长、真的滚得动（否则下面几条是白给的）", bar.maximum() > 0, True)
+    ck("开窗之后停在底部", win._at_bottom(), True)
+
+    # 直接喂增量走 _on_chunk —— 这正是她流式回话时走的那条路，不用起网络
+    win.pending_text = ""
+    win.pending = win._append_widget("", False)
+    pump(50)
+    ck("流式开始时在底部（此刻不在的话这条测的就不是「跟随」）",
+       win._at_bottom(), True)
+    max0 = bar.maximum()
+
+    for _ in range(12):
+        win._on_chunk("喵喵喵喵喵喵喵喵喵喵喵喵喵喵喵喵喵喵喵喵\n")
+        pump(30)
+
+    ck("流式期间内容真的长高了（否则「贴着底部」是白给的）",
+       bar.maximum() > max0, True)
+    ck("流式过程中始终贴着底部", bar.value() >= bar.maximum() - 4, True)
+    ck("就是底部，不是「差几个像素」", bar.maximum() - bar.value(), 0)
+
+    # 反过来的那条：用户自己往上翻之后不许再被拽下去
+    bar.setValue(0)
+    pump(50)
+    ck("往上翻之后不再跟随", win._stick, False)
+    before = bar.value()
+    for _ in range(6):
+        win._on_chunk("再多一行喵\n")
+        pump(30)
+    ck("往上翻着的时候喂 chunk 不会被拽下去", bar.value(), before)
+    win.close()
+
+
+class _FakeDwm:
+    """一个固定返回某个 HRESULT 的 dwmapi 替身。只能这么测 —— 真 DWM 在 Win11 上
+    永远回 S_OK，那正是不接 HRESULT 也看不出来的原因。"""
+
+    def __init__(self, hr: int):
+        self.hr = hr
+        self.attrs = []
+
+    def DwmSetWindowAttribute(self, hwnd, attr, ptr, size):   # noqa: N802  照着真名写
+        self.attrs.append(attr.value)
+        return self.hr
+
+
+def case_titlebar_rejects_hresult() -> None:
+    """W11：paint_titlebar 必须接住非零 HRESULT，不能当成功。
+
+    返回值是这件事上**唯一**存在的信号（DwmGetWindowAttribute 读不回来，见那儿
+    的注释），所以「DWM 明确拒绝」和「上色成功」只能靠 HRESULT 区分。不接的话外面
+    那层 try 抓不到非零返回码，结果是 _titlebar_painted 被置上（不再重试）而一行
+    日志都没有。把 `if hr != 0` 整段删掉，改前两套测试照样全绿。
+
+    打桩 dwm，而不是靠 offscreen 那个 E_HANDLE：后者在别的平台上会假红。
+    """
+    print("标题栏：DWM 回非零 HRESULT 时不能当成功：")
+    if sys.platform != "win32":
+        print("    跳过：非 Windows 上 paint_titlebar 直接返回 False，那是设计内的")
+        return
+    import ctypes
+    win = new_window({})
+    real_windll = ctypes.windll
+    buf = io.StringIO()
+    try:
+        ctypes.windll = type("_W", (), {"dwmapi": _FakeDwm(0x80070006)})()
+        with contextlib.redirect_stdout(buf):
+            ok = CW.paint_titlebar(win, "#FBE3EA", "#3A2E34")
+        bad = ctypes.windll.dwmapi
+        # 正面控制：同一个替身回 S_OK 时必须成功。没有这条的话「恒返回 False」
+        # 也能过上面那条断言，等于没测。
+        ctypes.windll = type("_W", (), {"dwmapi": _FakeDwm(0)})()
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok_good = CW.paint_titlebar(win, "#FBE3EA", "#3A2E34")
+        good = ctypes.windll.dwmapi
+    finally:
+        ctypes.windll = real_windll
+    ck("DWM 拒绝时返回 False", ok, False)
+    # 第一个属性被拒绝就收手（不接着试第二个、更不假装成功）—— 这儿的实现就是
+    # 这么写的，钉住它免得以后有人把它改成「继续试下一个」
+    ck("第一个属性被拒绝就收手", bad.attrs, [35])
+    ck("打了带 HRESULT 的日志", "HRESULT=0x80070006" in buf.getvalue(), True)
+    ck("DWM 接受时返回 True（否则上一条是恒真的）", ok_good, True)
+    ck("接受那一轮两个属性也都试了", good.attrs, [35, 36])
+    win.close()
+
+
+def case_restore_geometry() -> None:
+    """W12：存下来的窗口几何要真的用上。
+
+    用户会直接骂的一条 —— 窗口位置和大小每次开窗都忘。改前没有任何断言覆盖
+    _restore_geometry 里那个 setGeometry（把它换成「忽略存的值」套件全绿）。
+    """
+    print("窗口几何回填：")
+    cfg = dict(cfgmod.DEFAULTS)
+    cfg["chat_geometry"] = [123, 77, 456, 600]
+    win = new_window(cfg)
+    ck("建出来的窗口按存下来的几何摆好了",
+       [win.x(), win.y(), win.width(), win.height()], [123, 77, 456, 600])
+    win.close()
+
+    # 反面：没存过就落到默认大小 —— 不然「永远用一个写死的几何」也能过上面那条
+    win2 = new_window(dict(cfgmod.DEFAULTS))
+    ck("没存过就用默认大小", (win2.width(), win2.height()), (420, 560))
+    win2.close()
 
 
 def case_titlebar() -> None:
@@ -667,13 +845,20 @@ def case_menu_entry() -> None:
     if pet is None:
         return
     try:
-        items = [a.text() for a in pet.build_menu().actions()]
+        menu = pet.build_menu()
+        items = [a.text() for a in menu.actions()]
         ck("菜单里有「和她说话」「编辑人设」「清空对话记录」",
            [t for t in ("和她说话", "编辑人设", "清空对话记录") if t in items],
            ["和她说话", "编辑人设", "清空对话记录"])
-        pet.open_chat()
+        # W16：只查菜单里有没有这几个字是不够的 —— addAction 的第二个参数接错了
+        # 方法，字面照样在。实测「和她说话」接到 refresh_balance 上时整条套件全绿，
+        # 而用户点下去是「刷新余额」。trigger() 走的就是真点击那条路。
+        ck("触发之前没开着聊天窗", getattr(pet, "chat", None), None)
+        talk = [a for a in menu.actions() if a.text() == "和她说话"][0]
+        talk.trigger()
+        ck("「和她说话」真的开出了聊天窗口",
+           type(getattr(pet, "chat", None)).__name__, "ChatWindow")
         first = pet.chat
-        ck("开出来的是聊天窗口", type(first).__name__, "ChatWindow")
         pet.open_chat()                                 # 再点一次
         ck("连点两次只有一个窗口", pet.chat is first, True)
 
@@ -807,46 +992,71 @@ def case_config_geometry_roundtrip() -> None:
     ck("在 DEFAULTS 里（load 的过滤才留得住它）", "chat_geometry" in cfgmod.DEFAULTS, True)
 
 
-def case_config_atomic_save() -> None:
-    """config.save() 必须是原子写：不留 .tmp，替换失败时不能把原文件弄坏。
+def _atomic_save_case(label, path, save, load, first, second, read,
+                      log_word, unlinks_tmp_on_fail) -> None:
+    """一条原子写用例，对 config.save / chat_store.save 各跑一遍。
 
-    不是「好看」而已：这份配置里有 API Key，非原子写正好在写到一半时被杀/断电，
-    文件就废了 —— 表现是「每次启动 Key 都变空」，用户一点线索都没有。chat_store
-    早就这么写了，config 跟着它一个形状。
+    为什么要各跑一遍：这条用例原来打桩的是 **config.save**，而真正每轮回复都要覆写
+    一次的是 chat_store.save —— 那份里装着用户全部的对话历史，写到一半被杀/断电就
+    把记录弄废，正是原子写要防的事。实测：chat_store.save 改成非原子直写，
+    test_units 和 test_chat_window **两个都全绿**（对照组的 config 同一改法红 4 项，
+    说明手法没问题，缺口精确地落在 chat_store 上）。
     """
-    print("配置原子写：")
-    p = cfgmod.CONFIG_PATH
-    tmp = p.parent / (p.name + ".tmp")
-    cfg = dict(cfgmod.DEFAULTS)
-    # 值必须跟 DEFAULTS 里的**不一样**（height 的默认是 200）。用默认值的话 load()
-    # 无论文件在不在、是不是刚写的都会返回它，下面那条断言就成了恒真的摆设 ——
-    # 名字声称验了一次往返，实际什么都没验。
-    cfg["height"] = 240
-    cfgmod.save(cfg)
-    ck("存完之后没留下 .tmp", tmp.exists(), False)
-    ck("存进去的读得回来", cfgmod.load()["height"], 240)
+    print(f"{label}原子写：")
+    tmp = path.parent / (path.name + ".tmp")
+    save(first)
+    ck(f"{label}：存完之后没留下 .tmp", tmp.exists(), False)
+    ck(f"{label}：存进去的读得回来", read(load()), read(first))
 
     # 替换失败：磁盘满、杀软锁住目标、文件被别的程序占用都会这样。打桩的是 os.replace
-    # 本身，所以非原子写（直接 write_text 覆盖目标）在这条下会当场露馅 —— 目标文件已经
-    # 被新内容覆盖掉一半了。断言的就是「宁可这次没存上，也不能把上一次存好的弄坏」。
-    before = p.read_text(encoding="utf-8")
+    # 本身，所以非原子写（直接 write_text 覆盖目标）在这条下会当场露馅 —— 目标文件
+    # 已经被新内容覆盖掉一半了。断言的就是「宁可这次没存上，也不能把上一次存好的弄坏」。
+    before = path.read_text(encoding="utf-8")
     real_replace = os.replace
 
     def boom(*a, **k):
         raise OSError("打桩：替换这一步失败")
 
-    os.replace = boom                 # config.save() 里用的就是 os.replace
+    os.replace = boom                 # 两个模块的 save() 里用的都是 os.replace
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):           # 这一笔失败是故意的，别刷到屏幕上
-            cfgmod.save({**cfg, "height": 999})
+            save(second)
     finally:
         os.replace = real_replace
-    # 比整份文本而不是只看 height：后者过得去、文件却可能已经被写坏成半截
-    ck("原文件一字没变", p.read_text(encoding="utf-8") == before, True)
-    ck("读回来还是老值", cfgmod.load()["height"], 240)
-    # 失败必须留下痕迹：静默吞掉的写失败，用户只会看到「Key 又没了」而查不出原因
-    ck("打了一行「存不了」的日志", "存不了 config.json" in buf.getvalue(), True)
+    # 比整份文本而不是只看某一个字段：后者过得去、文件却可能已经被写坏成半截
+    ck(f"{label}：原文件一字没变", path.read_text(encoding="utf-8"), before)
+    ck(f"{label}：读回来还是老值", read(load()), read(first))
+    # 失败必须留下痕迹：静默吞掉的写失败，用户只会看到「记录又没了」而查不出原因
+    ck(f"{label}：打了一行日志", log_word in buf.getvalue(), True)
+    # 失败之后那份 .tmp 里装着完整内容（聊天记录那份是整份对话），不能让它躺在盘上。
+    # config.save 那一支**有意**不删（docstring 里把「死在中间会留下 .tmp」写成了已知
+    # 代价），所以这条只对 chat_store 断言。
+    if unlinks_tmp_on_fail:
+        ck(f"{label}：失败之后也没留下 .tmp", tmp.exists(), False)
+
+
+def case_atomic_save() -> None:
+    """config.save() 和 chat_store.save() 都必须是原子写。
+
+    不是「好看」而已：config 里有 API Key、chat.json 里有全部对话，非原子写正好在
+    写到一半时被杀/断电，文件就废了 —— 表现是「每次启动 Key 都变空」「聊天记录全
+    没了」，用户一点线索都没有。
+    """
+    cfg = dict(cfgmod.DEFAULTS)
+    # 值必须跟 DEFAULTS 里的**不一样**（height 的默认是 200）。用默认值的话 load()
+    # 无论文件在不在、是不是刚写的都会返回它，下面那条断言就成了恒真的摆设 ——
+    # 名字声称验了一次往返，实际什么都没验。
+    cfg["height"] = 240
+    _atomic_save_case(
+        "配置", cfgmod.CONFIG_PATH, cfgmod.save, cfgmod.load,
+        cfg, {**cfg, "height": 999},
+        lambda c: c["height"], "存不了 config.json", False)
+    _atomic_save_case(
+        "聊天记录", chat_store.CHAT_PATH, chat_store.save, chat_store.load,
+        [chat_store.make("user", "在吗")],
+        [chat_store.make("user", "在吗"), chat_store.make("assistant", "在呢喵")],
+        lambda ms: [m["content"] for m in ms], "存不了聊天记录", True)
 
 
 def case_avatar_cached() -> None:
@@ -1005,15 +1215,18 @@ def main() -> int:
         run_case(case_two_sends_same_window)
         run_case(case_on_done_overwrites_bubble)
         run_case(case_bubbles_painted)
+        run_case(case_stream_follows_scroll)
         run_case(case_wedged_worker_keeps_ref)
         run_case(case_titlebar)
+        run_case(case_titlebar_rejects_hresult)
         run_case(case_quit_while_streaming)
         run_case(case_menu_entry)
         run_case(case_double_click)
         run_case(case_quit_clears_chat)
         run_case(case_close_chat_wedged)
         run_case(case_config_geometry_roundtrip)
-        run_case(case_config_atomic_save)
+        run_case(case_restore_geometry)
+        run_case(case_atomic_save)
         run_case(case_avatar_cached)
     finally:
         srv.shutdown()
