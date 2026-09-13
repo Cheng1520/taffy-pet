@@ -115,6 +115,10 @@ def test_chat_store() -> None:
                                     '{"role":"user","content":"好的"}]}',
                                     encoding="utf-8")
             ck("丢掉残缺的条目", [m["content"] for m in CS.load()], ["好的"])
+            # 记事本另存为 ANSI/GBK 是最常见的一种坏法：字节不是合法 UTF-8，
+            # read_text 直接抛 UnicodeDecodeError，它不继承 OSError，必须单独接住
+            CS.CHAT_PATH.write_bytes("聊天".encode("gbk"))
+            ck("GBK 文件当空的处理", CS.load(), [])
 
             CS.clear()
             ck("清空之后", CS.load(), [])
@@ -122,6 +126,95 @@ def test_chat_store() -> None:
             print("  ok   重复清空不报错")
         finally:
             CS.CHAT_PATH = old
+
+
+def test_chat_prompt() -> None:
+    print("人设拼装：")
+    from taffy_pet import chat as CH
+
+    p = CH.build_system_prompt("你是塔菲。")
+    ck("人设在最前面", p.startswith("你是塔菲。"), True)
+    ck("带上了回复要短这条", "回复要短" in p, True)
+    ck("带上了不许自称 AI", "不要说自己是 AI" in p, True)
+    ck("带上了不许提 DeepSeek", "不要提到 DeepSeek" in p, True)
+
+
+def test_chat_trim() -> None:
+    print("历史裁剪：")
+    from taffy_pet import chat as CH
+
+    def m(role, n):
+        return {"role": role, "content": f"{role}{n}"}
+
+    ck("空历史不炸", CH.trim_history([]), [])
+
+    short = [m("user", 1), m("assistant", 2)]
+    ck("不够长就全带上", len(CH.trim_history(short)), 2)
+
+    # 40 条交替，裁剪后应该只剩最后 20 条
+    long = [m("user" if i % 2 == 0 else "assistant", i) for i in range(40)]
+    got = CH.trim_history(long)
+    ck("裁到上限", len(got), CH.MAX_CONTEXT_MESSAGES)
+    ck("留的是最新的", got[-1]["content"], "assistant39")
+
+    # 裁完开头是 assistant 的时候，再丢一条 —— 那句话没前文，
+    # 模型容易当成「自己刚说过的」顺着往下接
+    odd = [m("assistant", i) if i % 2 == 0 else m("user", i) for i in range(40)]
+    got = CH.trim_history(odd)
+    ck("首条必须是 user", got[0]["role"], "user")
+    ck("留的是最新的（另一边）", got[-1]["content"], "user39")
+
+    msgs = CH.build_messages("人设", short)
+    ck("system 在最前", msgs[0]["role"], "system")
+    ck("system 内容", msgs[0]["content"], CH.build_system_prompt("人设"))
+    ck("后面是历史", [x["role"] for x in msgs[1:]], ["user", "assistant"])
+    ck("只带 role 和 content", sorted(msgs[1].keys()), ["content", "role"])
+
+
+def test_sse_parse() -> None:
+    print("SSE 解析：")
+    from taffy_pet import chat as CH
+
+    def data(t):
+        return f'data: {{"choices":[{{"delta":{{"content":"{t}"}}}}]}}\n\n'
+
+    # 一次给一整块的正常情况
+    buf, out, done = CH.parse_sse_lines("", data("在") + data("呢") + "data: [DONE]\n\n")
+    ck("整块", (out, done), (["在", "呢"], True))
+
+    # 跨块：切在半个 JSON 中间
+    raw = data("在") + data("呢")
+    buf, out, done = CH.parse_sse_lines("", raw[:20])
+    ck("半行不吐", out, [])
+    buf, out2, done = CH.parse_sse_lines(buf, raw[20:])
+    ck("补齐后吐出来", out2, ["在", "呢"])
+
+    # 逐字节喂 —— 最狠的一种切法，模拟网络任意分块
+    # done 要跟 acc 一样跨轮累积：它只表示「这一轮切出了 [DONE]」，
+    # 而 [DONE] 那一行是被倒数第二个字符（换行）补完的，最后一轮吃的是空行，
+    # 只看最后一轮的 done 永远是 False
+    buf, acc, saw_done = "", [], False
+    for ch in raw + "data: [DONE]\n\n":
+        buf, out, done = CH.parse_sse_lines(buf, ch)
+        acc += out
+        saw_done = saw_done or done
+    ck("逐字节喂结果一样", acc, ["在", "呢"])
+    ck("逐字节也能收到 DONE", saw_done, True)
+
+    # 各种脏东西都不能炸
+    for name, feed in [
+        ("空 delta", 'data: {"choices":[{"delta":{}}]}\n\n'),
+        ("没有 choices", 'data: {"usage":{"total_tokens":9}}\n\n'),
+        ("choices 是空表", 'data: {"choices":[]}\n\n'),
+        ("坏 JSON", 'data: {不是 json\n\n'),
+        ("非 data 行", ': keep-alive\n\n'),
+        ("空行", '\n\n'),
+    ]:
+        try:
+            buf, out, done = CH.parse_sse_lines("", feed)
+            ck(name, (out, done), ([], False))
+        except Exception as e:                      # noqa: BLE001
+            ck(name, f"炸了 {type(e).__name__}", "不该炸")
 
 
 def test_bounce() -> None:
@@ -150,6 +243,9 @@ def main() -> int:
     test_apikey()
     test_persona_path()
     test_chat_store()
+    test_chat_prompt()
+    test_chat_trim()
+    test_sse_parse()
     test_bounce()
     print()
     if FAILS:
