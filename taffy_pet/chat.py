@@ -13,6 +13,9 @@
 import codecs
 import json
 
+from PyQt5.QtCore import QThread, pyqtSignal
+import requests
+
 from .paths import persona_path
 
 API_URL = "https://api.deepseek.com/chat/completions"
@@ -102,3 +105,92 @@ def parse_sse_lines(buf: str, text: str):
         if piece:
             out.append(piece)              # 首块只有 role 没有 content，这里自然跳过
     return buf, out, done
+
+
+class ChatWorker(QThread):
+    """发一次请求，边收边 emit。要再发一轮就 new 一个。"""
+
+    chunk = pyqtSignal(str)      # 增量文本
+    done = pyqtSignal(str)       # 完整回复（被停止时就是已经收到的部分）
+    fail = pyqtSignal(str)       # 给人看的错误说明
+
+    def __init__(self, api_key: str, messages: list, parent=None):
+        super().__init__(parent)
+        self.api_key = api_key
+        self.messages = messages
+        self._stop = False
+
+    def stop(self) -> None:
+        """只是置个标志位。requests 阻塞在读上，所以要等下一块数据到了才真的停 ——
+        她回话时是连续吐字的，通常一秒内就停了。"""
+        self._stop = True
+
+    def run(self) -> None:
+        # run() 里漏出去的异常，在打包后（没有控制台）会让 PyQt 直接 abort，
+        # 连堆栈都看不到。兜住它，至少给用户一句人话。
+        try:
+            self._run()
+        except Exception as e:                      # noqa: BLE001
+            self.fail.emit(f"出错了：{type(e).__name__}")
+
+    def _run(self) -> None:
+        if not self.api_key:
+            self.fail.emit("还没设置 API Key\n右键点 taffy →「设置 API Key」")
+            return
+
+        try:
+            r = requests.post(
+                API_URL,
+                headers={"Authorization": f"Bearer {self.api_key}",
+                         "Content-Type": "application/json",
+                         "Accept": "text/event-stream"},
+                json={"model": MODEL, "messages": self.messages,
+                      "stream": True, "temperature": TEMPERATURE},
+                timeout=TIMEOUT, stream=True)
+        except requests.Timeout:
+            self.fail.emit("连接超时（网络不通？）")
+            return
+        except requests.RequestException as e:
+            self.fail.emit(f"网络错误：{type(e).__name__}")
+            return
+
+        try:
+            if r.status_code == 401:
+                self.fail.emit("API Key 无效")
+                return
+            if r.status_code == 402:
+                self.fail.emit("余额不足，去 DeepSeek 充值")
+                return
+            if r.status_code != 200:
+                self.fail.emit(f"接口返回 {r.status_code}")
+                return
+
+            # 增量解码：一个网络分块完全可能把一个汉字切成两半，
+            # 解码器会把不完整的尾巴留到下一块，不能自己 decode。
+            decoder = codecs.getincrementaldecoder("utf-8")()
+            buf = ""
+            parts = []
+            for raw in r.iter_content(chunk_size=None):
+                if self._stop:
+                    break
+                if not raw:
+                    continue
+                buf, out, _done = parse_sse_lines(buf, decoder.decode(raw))
+                for piece in out:
+                    parts.append(piece)
+                    self.chunk.emit(piece)
+
+            # 流读完了，缓冲里可能还压着最后一行 —— 服务端最后一行没补换行的话，
+            # 那几个字会被静默丢掉，正是「回复偶尔缺几个字」那种最难查的问题。
+            # 补一个换行把它冲出来；万一是半行截断的 JSON，parse_sse_lines 解不出来会跳过，是安全的。
+            _buf, tail, _ = parse_sse_lines(buf, "\n")
+            for piece in tail:
+                parts.append(piece)
+                self.chunk.emit(piece)
+        except requests.RequestException as e:
+            self.fail.emit(f"网络中断：{type(e).__name__}")
+            return
+        finally:
+            r.close()
+
+        self.done.emit("".join(parts))
