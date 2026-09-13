@@ -77,3 +77,43 @@ window（`WS_EX_LAYERED`），透明像素点得穿 —— `WindowFromPoint` 打
 边距取角色高度的 6.5%（`pet.py` 的 `MARGIN_RATIO`）：呼吸 0.8% + 弹跳拉伸 3.0% + 腾空 1.6%
 = 5.4%，留了余量。这个比例同样是量出来的 —— `tools/smoke.py` 会走完整条弹跳曲线验证不溢出，
 并断言压扁幅度 ≥5%。
+
+## 打包成安装程序
+
+`taffy-pet.spec`（PyInstaller）+ `installer/taffy-pet.iss`（Inno Setup）。这三个坑都
+安安静静地失败，不报错，只在实机跑一遍才看得出来。
+
+### `PrivilegesRequiredOverridesAllowed` 里绝对不能写 `dialog`
+
+写了 `dialog`，Inno 会在启动时先弹一个「选择安装模式（仅为我 / 所有用户）」的框，**而且
+这个框在 `/VERYSILENT` 下照样弹**。
+
+后果是静默安装永久卡住：进程活着、CPU 几乎不动、安装日志只写到「Created temporary
+directory」就没了，既不报错也不退出。我一开始以为是自己脚本写错了，编译了一个只装一个
+文件的空安装包 —— 一样卡。
+
+现在只留 `commandline`，默认走非管理员的「仅为我安装」。真想装给所有用户的人自己传
+`/ALLUSERS`。
+
+### 非管理员模式下，Inno 不做「关闭占用文件的程序」
+
+Inno 那套靠 Restart Manager 的 `CloseApplications` 只在管理员安装模式下生效。日志里会
+写 `Administrative install mode: No`，然后这一步就静默失效了。
+
+实测后果比想象中难查：**塔菲开着的时候卸载，卸载器退出码 0、注册表项和快捷方式都清干净、
+但程序目录一个文件没删。** 用户看到的是「卸载了，但还在」。
+
+解法是在 `[Code]` 里自己动手（`installer/taffy-pet.iss` 的 `StopRunningPet`）：装之前和卸
+之前各跑一次 `taskkill /IM TaffyPet.exe /T`，**不带 `/F`** —— 先温和地送 `WM_CLOSE`，她
+的 `closeEvent` 会借这个机会把窗口位置存回 `config.json`（实测退出后 `pos` 确实被更新了）；
+等 1.2 秒还在，再 `/F` 强杀。
+
+### `.iss` 必须存成带 BOM 的 UTF-8
+
+Inno 6 靠 BOM 判断编码，没有 BOM 就按系统 ANSI 码页解 —— 中文 Windows 上是 GBK，整个
+安装界面会全变乱码。`Write` 写出来的是不带 BOM 的 UTF-8，得手动补
+（`b"\xef\xbb\xbf" + raw`）。
+
+顺带：**Inno 官方的语言包不含中文**，得自己带一份。`installer/languages/ChineseSimplified.isl`
+是从 jrsoftware/issrc 的 `Files\Languages\` 取的官方译文（6.5.0+ 版），原样存着别改。
+引用它用 `{#SourcePath}\languages\...`，这样从哪个目录调 `ISCC` 都找得到。

@@ -15,7 +15,17 @@
 - **无边框透明置顶窗口** —— 不占任务栏，透明的地方点得穿，不会挡住下面的桌面图标
 - **双击图标启动，不会起出第二只**（连点两下只会让她蹦一下）
 
-## 环境要求
+## 安装（不用碰 Python）
+
+到 [Releases](https://github.com/Cheng1520/taffy-pet/releases) 下载 `TaffyPet-Setup-*.exe`，
+双击下一步下一步就行。
+
+- 装到 `%LOCALAPPDATA%\Programs\TaffyPet`，**全程不弹 UAC**（想装给整台机器就传 `/ALLUSERS`）
+- 会建开始菜单项和桌面快捷方式，卸载走「设置 → 应用」，会一起清掉
+- 配置和日志在 `%APPDATA%\TaffyPet\`。卸载时**故意不删这个目录** —— 你的 API Key 在里面，
+  重装一次还要重填是最烦人的失败方式。想彻底清干净就自己删掉它。
+
+## 环境要求（从源码跑）
 
 | | |
 | --- | --- |
@@ -66,8 +76,8 @@ python tools/make_shortcut.py
 ### 看不到她 / 起不来
 
 - 默认位置在**屏幕右下角、任务栏上方**。
-- 起不来会弹一个「塔菲起不来」的框，堆栈写进项目根目录的 `taffy.log` —— 用桌面图标启动时
-  没有控制台，不这么做就只会是「双击没反应」。
+- 起不来会弹一个「塔菲起不来」的框，堆栈写进 `taffy.log`（从源码跑在项目根目录，
+  装成安装包在 `%APPDATA%\TaffyPet\`）—— 没有控制台时，不这么做就只会是「双击没反应」。
 - 想直接看日志：在项目目录跑 `python main.py`，日志打在控制台里。
 
 ### 双击两次不会起出两只
@@ -85,7 +95,16 @@ python tools/make_shortcut.py
 1. 环境变量 `DEEPSEEK_API_KEY` —— 推荐，Key 不落盘
 2. 右键她 →「设置 API Key」，粘进输入框，存到 `config.json`
 
-`config.json` 已经在 `.gitignore` 里，不会被提交。
+`config.json` 已经在 `.gitignore` 里，不会被提交。它的位置分两种：
+
+| 运行方式 | `config.json` / `taffy.log` 在哪 |
+| --- | --- |
+| 从源码跑 | 项目根目录（改起来方便） |
+| 装成安装包 | `%APPDATA%\TaffyPet\` |
+
+装完之后数据**必须**离开程序目录：`Program Files` 底下是只读的，普通权限写不进去，
+存那儿会静默失败 —— 表现就是「每次启动 API Key 都要重填」。路径解析统一收在
+`taffy_pet/paths.py`。
 
 余额走 `GET https://api.deepseek.com/user/balance`。Key 无效会显示「API Key 无效」，
 网络不通显示「查询超时」，都不会影响她说话和蹦跳。
@@ -128,6 +147,27 @@ python tools/extract_audio.py <视频路径> click
 脚本会掐掉首尾静音、做峰值归一化，输出 `assets/sounds/click.wav`。依赖里的
 `imageio-ffmpeg` 自带一份 ffmpeg，不用另外装。
 
+## 自己打包安装程序
+
+需要 [PyInstaller](https://pyinstaller.org/) 和 [Inno Setup 6](https://jrsoftware.org/isdl.php)。
+两个都会写进 `%LOCALAPPDATA%` 或 `Program Files`，直接装即可。
+
+```bash
+pip install pyinstaller
+python -m PyInstaller taffy-pet.spec
+ISCC.exe installer\taffy-pet.iss
+```
+
+第一步产出 `dist/TaffyPet/`，第二步把它压成一个安装包放进 `installer/Output/`。
+`ISCC.exe` 的完整路径一般是
+`%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe`。
+
+选 **onedir 而不是 onefile**：onefile 每次启动都要把几十兆解压到临时目录，PyQt5 这么大，
+冷启动肉眼可见地慢。反正外面还套一层安装程序，用户看不到文件夹里有多少东西。
+
+这一步有三个坑（`dialog` 静默卡死、BOM、非管理员模式下卸载删不掉文件），都写在
+[实现笔记](docs/implementation-notes.md#打包成安装程序)里了 —— 改安装脚本之前先看一眼。
+
 ## 自检
 
 ```bash
@@ -143,6 +183,7 @@ python tools/smoke.py          # 起窗口、截图、验证边界与幅度、�
 ```
 main.py                    入口：单实例检查、崩溃兜底
 taffy_pet/
+  paths.py                 素材/数据各在哪（源码运行与打包后的差别全收在这里）
   config.py                配置读写、API Key 优先级（环境变量 > 文件）
   balance.py               查 DeepSeek 余额（放在线程里，不冻界面）
   toast.py                 气泡：说话内容和余额共用一个窗口
@@ -151,10 +192,14 @@ taffy_pet/
 tools/
   build_assets.py          抠图 + 眼睛定位 + 闭眼帧
   extract_audio.py         从录屏提取音效
-  make_shortcut.py         生成图标 + 桌面快捷方式
+  make_shortcut.py         生成图标 + 桌面快捷方式（源码运行方式用）
   smoke.py                 冒烟测试
   test_units.py            单元测试
   _blink_explore.py        闭眼帧的探索记录（含失败史）
+installer/
+  taffy-pet.iss            Inno Setup 安装脚本
+  languages/               中文界面译文（Inno 不自带，从官方 issrc 取的）
+taffy-pet.spec             PyInstaller 打包配置
 docs/
   implementation-notes.md  实现笔记：踩过的坑
 ```
@@ -170,6 +215,8 @@ docs/
 - **弹跳用关键帧，不用弹簧** —— 阻尼会把回弹那一侧吃掉，压扁 5% 而拉伸只剩 1%。
 - **素材像素和显示尺寸彻底解耦** —— 高 DPI 屏上把素材 1:1 画出去，角色会整只跑到屏幕外；
   同理动画里不能有写死的像素。
+- **打包** —— 三个安安静静失败的坑：安装模式选择框在静默安装下照样弹、非管理员模式卸载
+  删不掉正在运行的程序、`.iss` 不带 BOM 会整片乱码。
 
 ## 版权
 

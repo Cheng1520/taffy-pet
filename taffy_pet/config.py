@@ -8,10 +8,9 @@ config.json 在 .gitignore 里 —— 里面有 Key，绝不能进版本库。
 """
 import json
 import os
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = ROOT / "config.json"
+from .paths import CONFIG_PATH, ensure_data_dir
+
 ENV_KEY = "DEEPSEEK_API_KEY"
 
 DEFAULTS = {
@@ -43,6 +42,7 @@ def load() -> dict:
 
 
 def save(cfg: dict) -> None:
+    ensure_data_dir()      # 打包之后数据目录在 %APPDATA%，第一次可能是空的
     try:
         CONFIG_PATH.write_text(
             json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")

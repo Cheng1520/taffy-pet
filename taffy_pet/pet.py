@@ -3,8 +3,6 @@
 点击 = 说话 + 弹余额 + 播音效 + 弹一下。拖拽和点击要靠位移量区分 ——
 否则想挪个位置就会触发一次说话。
 """
-from pathlib import Path
-
 from PyQt5.QtCore import Qt, QRectF, QTimer
 from PyQt5.QtGui import QPainter, QPixmap
 from PyQt5.QtWidgets import QApplication, QInputDialog, QLineEdit, QMenu, QWidget
@@ -12,10 +10,8 @@ from PyQt5.QtWidgets import QApplication, QInputDialog, QLineEdit, QMenu, QWidge
 from . import config as cfgmod
 from .anim import PetAnimator
 from .balance import BalanceFetcher
+from .paths import ASSETS
 from .toast import Toast
-
-ROOT = Path(__file__).resolve().parent.parent
-ASSETS = ROOT / "assets"
 
 # 边距是角色显示高度的比例，不是固定像素 —— 角色的放大/弹跳都是按比例缩放的，
 # 固定边距在角色调小之后会显得过大、调大之后又不够。

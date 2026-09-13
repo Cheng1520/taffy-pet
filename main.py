@@ -8,17 +8,14 @@
 import os
 import sys
 import traceback
-from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from taffy_pet import config as cfgmod
+from taffy_pet.paths import LOG_PATH as LOG, ensure_data_dir
 from taffy_pet.pet import PetWindow
-
-ROOT = Path(__file__).resolve().parent
-LOG = ROOT / "taffy.log"
 
 # 同名 QLocalServer 只能有一个，第二个进程 listen 会失败 —— 拿它判断
 # 「是不是已经有一只塔菲在跑了」。双击桌面图标最容易犯的错就是连点两下，
@@ -46,6 +43,7 @@ def _quiet_broken_output() -> None:
 def _fatal(msg: str) -> None:
     """起不来的时候必须让人看见 —— pythonw 下「双击没反应」什么线索都不留。"""
     try:
+        ensure_data_dir()
         LOG.write_text(msg, encoding="utf-8")
     except OSError:
         pass
@@ -90,6 +88,7 @@ def main() -> int:
         print("[塔菲] 已经有一只在跑了，让她蹦了一下就退出")
         return 0
 
+    ensure_data_dir()
     cfg = cfgmod.load()
     try:
         pet = PetWindow(cfg)

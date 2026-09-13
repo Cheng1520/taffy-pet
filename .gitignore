@@ -11,3 +11,9 @@ venv/
 
 # 仅供目检的中间图，能由 tools/build_assets.py 重新生成
 assets/_*.png
+
+# PyInstaller 和 Inno Setup 的产物，加起来一百多兆，要发布走 GitHub Release 的附件，
+# 不进版本库
+build/
+dist/
+installer/Output/
