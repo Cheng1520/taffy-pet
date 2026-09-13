@@ -175,15 +175,25 @@ class ChatWorker(QThread):
                     break
                 if not raw:
                     continue
-                buf, out, _done = parse_sse_lines(buf, decoder.decode(raw))
+                buf, out, done = parse_sse_lines(buf, decoder.decode(raw))
                 for piece in out:
                     parts.append(piece)
                     self.chunk.emit(piece)
+                # 收到 [DONE] 这一轮就结束。不 break 的话要靠服务端主动关连接 ——
+                # keep-alive 的连接不会关，客户端会一路挂到 30 秒读超时：回复早显示
+                # 完了，而「停止」按钮还要亮着最多半分钟。
+                if done:
+                    break
 
-            # 流读完了，缓冲里可能还压着最后一行 —— 服务端最后一行没补换行的话，
-            # 那几个字会被静默丢掉，正是「回复偶尔缺几个字」那种最难查的问题。
-            # 补一个换行把它冲出来；万一是半行截断的 JSON，parse_sse_lines 解不出来会跳过，是安全的。
+            # 两道冲刷，顺序不能反：
+            # 1) 解码器里可能还压着半个汉字（流正好切在字中间），先把它冲出来 ——
+            #    不冲的话它连着后面那个换行都进不了缓冲，直接静默丢。
+            # 2) 缓冲里可能还压着最后一行 —— 服务端最后一行没补换行的话，那几个字
+            #    会被静默丢掉，正是「回复偶尔缺几个字」那种最难查的问题。补一个换行
+            #    把它冲出来；万一是半行截断的 JSON，parse_sse_lines 解不出来会跳过，安全。
+            buf, tail0, _ = parse_sse_lines(buf, decoder.decode(b"", final=True))
             _buf, tail, _ = parse_sse_lines(buf, "\n")
+            tail = tail0 + tail
             for piece in tail:
                 parts.append(piece)
                 self.chunk.emit(piece)

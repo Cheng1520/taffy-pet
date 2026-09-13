@@ -48,7 +48,9 @@ def load() -> list:
     msgs = data.get("messages")
     if not isinstance(msgs, list):
         return []
-    return [m for m in msgs if _valid(m)]
+    # 读侧也要卡上限：save 只管自己写的那些，一份手工改过 / 从别处拷来的 chat.json
+    # 会被整份铺出来，而文档写的是「最多 200 条」。超了照样从最老的丢。
+    return [m for m in msgs if _valid(m)][-MAX_STORED:]
 
 
 def save(messages: list) -> None:
@@ -62,6 +64,12 @@ def save(messages: list) -> None:
         os.replace(tmp, CHAT_PATH)
     except OSError as e:
         print(f"[chat] 存不了聊天记录：{e}")
+        # 那份 .tmp 里装着完整的一份对话内容，不删就一直躺在盘上（下一次 save 才会
+        # 盖掉它）。config.save 那边同理，但那边写失败基本只可能是路径不通。
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def clear() -> None:
