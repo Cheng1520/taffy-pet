@@ -20,7 +20,9 @@ from .paths import persona_path
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-chat"
-TEMPERATURE = 1.3           # DeepSeek 官方对通用对话/创意的推荐值，偏活泼
+TEMPERATURE = 1.0           # 1.3 是 DeepSeek 给「诗歌/头脑风暴」的值，桌宠用太高：
+                            # 会开始自我发挥、越写越长、人设飘走。1.0 是通用对话档，
+                            # 人格主要靠 persona.md 里的例子撑，不靠调高温度。
 TIMEOUT = (8, 30)           # (连接, 读)：读超时是「两块之间」的间隔，不是总时长
 MAX_CONTEXT_MESSAGES = 20   # 每次发给接口的最大条数
 

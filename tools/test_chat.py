@@ -232,7 +232,9 @@ def main() -> int:
         print("发出去的请求：")
         sent = Handler.seen.get("json") or {}
         ck("模型是 deepseek-chat", sent.get("model"), "deepseek-chat")
-        ck("temperature 是 1.3", sent.get("temperature"), 1.3)
+        # 跟常量比，不写死数值 —— 这里要验的是「常量确实传进了请求体」，
+        # 不是「数值是多少」。写死的话每次调温度都要来改测试。
+        ck("temperature 传对了", sent.get("temperature"), CH.TEMPERATURE)
         ck("开着流式", sent.get("stream"), True)
         ck("带上了 Key", Handler.seen.get("auth"), "Bearer sk-test")
 
