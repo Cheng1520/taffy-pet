@@ -56,7 +56,8 @@ import test_chat as TC                                  # noqa: E402
 
 from PyQt5.QtCore import Qt, QEvent, QEventLoop, QPointF, QTimer   # noqa: E402
 from PyQt5.QtGui import QMouseEvent                     # noqa: E402
-from PyQt5.QtWidgets import QApplication, QMessageBox   # noqa: E402
+from PyQt5.QtWidgets import (QApplication, QMessageBox,  # noqa: E402
+                             QPushButton)
 
 from taffy_pet import chat as CH                        # noqa: E402
 from taffy_pet import chat_store                        # noqa: E402
@@ -360,6 +361,95 @@ def case_agent_tool_round() -> None:
     # 那些 tool_call_id 没有任何意义，读起来也莫名其妙。
     ck("聊天记录里没有 tool 角色",
        [m["role"] for m in chat_store.load()], ["user", "assistant"])
+
+    # 她调完工具留在气泡下面那一行小字。写的是工具返回的原话，所以直接对
+    # memory.add 的说法；自己另编一套措辞的话，两处迟早改歪一处。
+    ck("气泡下面挂了一行轨迹",
+       [t.text() for t in pend.traces], ["记住了：用户爱熬夜"])
+    ck("轨迹也落盘了（不落盘重开就凭空消失）",
+       chat_store.load()[-1].get("trace"), ["记住了：用户爱熬夜"])
+    # 它是**界面用的额外字段**，绝不能混进请求体：接口不认这个键，
+    # build_messages 只取 role/content 正是为了挡这个。
+    ck("轨迹没混进任何一次请求",
+       any("trace" in m for r in reqs for m in r["messages"]), False)
+    win.close()
+
+    # 重开窗口：轨迹要跟着历史一起回来
+    win2 = new_window({"api_key": "sk-test"})
+    ck("重开之后轨迹还在",
+       [t.text() for t in win2.area.findChildren(CW._Trace)],
+       ["记住了：用户爱熬夜"])
+    win2.close()
+
+
+def case_typing_animation() -> None:
+    r"""她还没吐字的那几秒：气泡里是**一帧一帧走**的点，而且宽度钉死。
+
+    钉宽度这条是真会出问题的：气泡按内容撑，而 ·/··/··· 三帧宽度不等，
+    不钉住整行就跟着一格一胀一缩。直接读 label 的最小宽度来验，比截图比对靠谱。
+
+    收尾那两条同样要紧：动画没停的话它会一直对着一个已经成了正文的气泡盖点，
+    屏幕上就成了「说着说着突然变回三个点」。
+    """
+    print("打字动画：")
+    chat_store.clear()
+    TC.Handler.delay = 0.05
+    TC.Handler.gate = threading.Event()
+    gate = TC.Handler.gate
+
+    win = new_window({"api_key": "sk-test"})
+    win.input.setPlainText("在吗")
+    win.send()
+    pend = win.pending
+
+    ck("刚发出去是第一帧", pend.text(), CW.TYPING)
+    ck("动画跑起来了", win._typing_timer.isActive(), True)
+
+    # **直接推格，不等真定时器。** 假接口是「先发第一行、再卡在 gate 上」，
+    # 首块立刻就到，`_on_chunk` 一跑动画就停了 —— 靠墙上时间等第二帧根本等不到，
+    # 那样测出来的是「这台机器多快」，不是「动画对不对」。
+    # 此刻一个事件都没泵过，所以已到的首块还压在队列里，`pending_text` 仍是空的。
+    got = [pend.text()]
+    for _ in range(len(CW.TYPING_FRAMES) * 2):
+        win._tick_typing()
+        got.append(pend.text())
+    ck("三帧按顺序循环走", got, ["·", "··", "···"] * 2 + ["·"])
+    ck("宽度钉的是最宽那帧", pend._label.minimumWidth(), pend._pin_w)
+
+    gate.set()
+    ck("收尾了", wait_until(lambda: win.worker is None), True)
+    ck("动画停了", win._typing_timer.isActive(), False)
+    ck("真字到了就松开宽度", pend._label.minimumWidth(), 0)
+    ck("气泡里是完整回复", pend.text(), FULL)
+    win.close()
+
+
+def case_suggest_buttons() -> None:
+    r"""快捷开场：一句都没聊过才露面，点一下真的发出去。
+
+    用 isHidden() 而不是 isVisible()：offscreen 下窗口从没 show() 过，子控件的
+    isVisible() 一律是 False，拿它验「露出来了」会得到一个永远失败的断言。
+    isHidden() 只看「有没有被显式藏起来」，正是这里要问的那件事。
+    """
+    print("快捷开场：")
+    chat_store.clear()
+    win = new_window({"api_key": "sk-test"})
+
+    ck("一句没聊过时露着", win.suggests.isHidden(), False)
+    btns = win.suggests.findChildren(QPushButton)
+    ck("三个按钮", len(btns), 3)
+    ck("文案就是 SUGGESTS", [b.text() for b in btns], list(CW.SUGGESTS))
+
+    # 三个按钮得并排塞进窗口**最窄**的那一档（setMinimumSize 的 320，左右各 14 边距、
+    # 之间 6 间距）。塞不下的话最后一个会被切掉半个字 —— 第一版文案就是这么翻车的，
+    # 而自己屏幕上开着 420 宽的话完全看不出来。改文案的人该被这一条拦下来。
+    need = sum(b.sizeHint().width() for b in btns) + 6 * (len(btns) - 1) + 14 * 2
+    ck(f"最窄的窗口也放得下（要 {need}px）", need <= 320, True)
+
+    btns[2].click()                      # 「陪我聊两句」
+    ck("点一下就把这句话发出去了", win.history[0]["content"], CW.SUGGESTS[2])
+    ck("收尾了", wait_until(lambda: win.worker is None), True)
+    ck("聊过之后不再露面", win.suggests.isHidden(), True)
     win.close()
 
 
@@ -1299,24 +1389,36 @@ def _shot() -> int:
     _isolate_paths(tmp)
     os.environ["QT_QPA_PLATFORM"] = "windows"   # offscreen 画不出字，见上面那段
     app = QApplication([sys.argv[0]])           # noqa: F841  建控件要用，必须接住引用
+
+    def shoot(win, name: str) -> bool:
+        win.setAttribute(Qt.WA_DontShowOnScreen, True)  # 建真窗口，但不映射到屏幕上
+        win.resize(420, 560)
+        win.show()
+        pump(300)
+        out = Path(CW.ASSETS) / name
+        ok = win.grab().save(str(out))
+        print(f"目检图：{out}（{'保存成功' if ok else '保存失败'}）")
+        win.close()
+        return ok
+
+    # 图一：有对话，而且她刚调过一次工具（气泡下面那行小字就是这么长出来的）
+    talked = chat_store.make("assistant", "那就先把肩膀放松一下，别看屏幕啦。\n我在这儿陪你。")
+    talked["trace"] = ["现在是 2026 年 9 月 15 日 03:12（凌晨，星期二）"]
     chat_store.save([
         chat_store.make("user", "在吗"),
         chat_store.make("assistant", "在呢喵～今天想聊点什么？"),
         chat_store.make("user", "今天有点累，随便聊聊吧"),
-        chat_store.make("assistant", "那就先把肩膀放松一下，别看屏幕啦。\n我在这儿陪你。"),
+        talked,
     ])
-    win = CW.ChatWindow({})
-    win.setAttribute(Qt.WA_DontShowOnScreen, True)   # 建真窗口，但不映射到屏幕上
-    win.resize(420, 560)
-    win.show()
-    pump(300)
-    out = Path(CW.ASSETS) / "_chat.png"
-    ok = win.grab().save(str(out))
-    print(f"目检图：{out}（{'保存成功' if ok else '保存失败'}）")
+    ok = shoot(CW.ChatWindow({}), "_chat.png")
+
+    # 图二：一句没聊过的样子 —— 右下那排快捷开场只在这个状态下才露面
+    chat_store.clear()
+    ok2 = shoot(CW.ChatWindow({}), "_chat_empty.png")
+
     print("    注意：grab() 只抓客户区，系统标题栏不在图里 —— 不是上色坏了。")
-    win.close()
     shutil.rmtree(tmp, ignore_errors=True)
-    return 0 if ok else 1
+    return 0 if (ok and ok2) else 1
 
 
 def case_day_separator() -> None:
@@ -1368,6 +1470,8 @@ def main() -> int:
         run_case(case_no_key)
         run_case(case_send_then_stream)
         run_case(case_agent_tool_round)
+        run_case(case_typing_animation)
+        run_case(case_suggest_buttons)
         run_case(case_agent_off)
         run_case(case_stop_mid_stream)
         run_case(case_close_mid_stream)

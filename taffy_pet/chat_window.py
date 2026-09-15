@@ -43,12 +43,31 @@ BTN_BUSY_HOVER = QColor(169, 158, 164)
 
 AVATAR_H = 56          # 头像立绘的高度；宽度按原图比例走，不固定
 
-# 她还没吐第一个字时气泡里显示的东西。
+# 她还没吐第一个字时气泡里显示的东西。**会一帧一帧走**。
 #
-# `_start_reply` 先把气泡建出来、首块到了才填字，中间这段时间（DeepSeek 通常 1~3 秒）
-# 屏幕上是一个**空气泡** —— 看着像界面卡住了。给个占位。
-# 别改成「正在输入…」那种长提示：气泡宽度是按内容撑的，一多一少会让整行跳一下。
-TYPING = "…"
+# `_start_reply` 先把气泡建出来、首块到了才填字，中间这段时间（DeepSeek 通常 1~3 秒，
+# 调工具的时候更久）屏幕上是一个**空气泡** —— 看着像界面卡住了。给个占位。
+#
+# 三帧是等宽钉死的（见 `_Bubble.set_text` 的 pin）：宽度按内容撑，一胀一缩会让整行
+# 左右跳。也别改成「正在输入…」那种长提示 —— 同理，而且它比三个点更吵。
+TYPING_FRAMES = ("·", "··", "···")
+TYPING_MS = 420        # 走一格的时间。太快像在抖，太慢又回到「卡住了」的观感
+TYPING = TYPING_FRAMES[0]      # 气泡刚建出来、定时器还没走过第一格时的样子
+
+# 快捷开场。只在**没有任何记录**的时候出现，点一下就替用户把话发出去。
+#
+# 挑这三句是有目的的：前两句各自会逼出她一个工具（`now` / `remember`），
+# 第三句是纯聊天。第一次打开的人不知道她能干什么、也不知道该说什么，
+# 一行字把「她能查时间、能记事、也能瞎聊」三件事摆出来。
+#
+# **长短是有约束的**：三个按钮得并排塞进窗口最窄的那一档（setMinimumSize 的
+# 320）。第一版第二句写的是「记住我在做塔菲桌宠」，420 宽就被切掉了最后一个字。
+# 改文案之前先按 320 算一遍宽度，别只看自己屏幕上开着的那个尺寸。
+SUGGESTS = ("现在几点？", "记住我爱熬夜", "陪我聊两句")
+
+# 消息区里「她调过工具」那一行小字的控件类型。单独定一个类是为了能
+# `findChildren(_Trace)` 一次全找出来调宽度 —— 和 `findChildren(_Bubble)` 一个用法。
+TRACE_OBJECT = "toolTrace"
 
 # 日期分隔线那个 QLabel 的 objectName。测试靠它把「日期分隔线」和「气泡/系统提示」
 # 分开数（见 tools/test_chat_window.py 的 texts()/rows()），改这个名字要一起改。
@@ -79,6 +98,14 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: tran
 #sendBtn[busy="true"] {{ background: {BTN_BUSY.name()}; }}
 #sendBtn[busy="true"]:hover {{ background: {BTN_BUSY_HOVER.name()}; }}
 #chatBar {{ background: {BAR_BG.name()}; border-top: 1px solid {BAR_LINE.name()}; }}
+#suggestBtn {{
+    background: #FFFFFF; color: {TEXT.name()}; border: 1px solid {BORDER.name()};
+    border-radius: 11px; padding: 4px 9px;
+    font-family: 'Microsoft YaHei UI'; font-size: 8.5pt;
+}}
+#suggestBtn:hover {{ background: {MINE_BG.name()}; color: #FFFFFF; border-color: {MINE_LINE.name()}; }}
+#suggestBtn:pressed {{ background: {MINE_LINE.name()}; }}
+#suggestBar {{ background: {BAR_BG.name()}; }}
 """
 
 _AVATAR = None         # 头像立绘的惰性缓存，见 _avatar_pixmap()
@@ -125,10 +152,15 @@ class _Bubble(QWidget):
     def __init__(self, text: str, mine: bool, parent=None):
         super().__init__(parent)
         self.mine = mine
+        # 她调工具留下的那几行小字（`_Trace` 控件）。**只有这一个列表** ——
+        # 落盘时从控件的 text() 现读，不另存一份字符串，两份迟早对不上。
+        self.traces = []
         self._label = QLabel(text, self)
         self._label.setWordWrap(True)
         self._label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self._label.setFont(QFont("Microsoft YaHei UI", 10))
+        # 打字动画那几帧宽度不等，钉住最宽的那帧。见 set_text。
+        self._pin_w = self._label.fontMetrics().horizontalAdvance(TYPING_FRAMES[-1])
         # 她的气泡文字跟 toast 同一个来源（这条 inline stylesheet 独立于模块级 QSS，
         # 手抄一份的话「改桌宠配色聊天窗跟着变」就又断在这儿）。白字那半边没有对应物：
         # 粉底上的白字 toast 里不存在，写死。
@@ -147,8 +179,18 @@ class _Bubble(QWidget):
         """
         return self._label.text()
 
-    def set_text(self, text: str) -> None:
+    def set_text(self, text: str, pin: bool = False) -> None:
+        r"""换掉气泡里的字。
+
+        `pin=True` 是给打字动画用的：那三帧（·/··/···）宽度不等，气泡是按内容撑的，
+        不钉住就会一格一胀一缩、整行左右跳 —— 正是 TYPING_FRAMES 上面那条注释说的
+        毛病。钉的时候按**最宽**那帧定，所以点最少的时候气泡也不会缩回去。
+
+        真字到了就 pin=False 放开：`setMinimumWidth(0)` 之后 QLabel 照旧按自己的
+        sizeHint 走，长句子该折行还是折行。
+        """
         self._label.setText(text)
+        self._label.setMinimumWidth(self._pin_w if pin else 0)
         self.updateGeometry()
 
     def paintEvent(self, _e) -> None:
@@ -169,6 +211,15 @@ class _Bubble(QWidget):
         p.setPen(QPen(MINE_LINE if self.mine else HERS_LINE, 1.2))
         p.setBrush(MINE_BG if self.mine else HERS_BG)
         p.drawPath(path)
+
+
+class _Trace(QLabel):
+    """她调完工具留在气泡下面的一行小字。
+
+    单独一个类没有别的作用，就是要一个能 `findChildren` 的类型 ——
+    `resizeEvent` 里要一次把所有轨迹行的宽度上限都刷一遍，混在普通 QLabel 里
+    挑不出来（日期分隔线、系统提示也都是 QLabel）。
+    """
 
 
 def day_label(ts: str) -> str:
@@ -194,6 +245,19 @@ def day_label(ts: str) -> str:
     if d.year == today.year:
         return f"{d.month}月{d.day}日"
     return f"{d.year}年{d.month}月{d.day}日"
+
+
+def full_ts(ts: str) -> str:
+    r"""气泡上鼠标悬停显示的那行时间；算不出来返回空串（跟 day_label 一个约定）。
+
+    日期分隔线只精确到天，想看「这句是上午还是半夜说的」就没有别的途径了。
+    悬停不动版面，也不会把消息区撑高。
+    """
+    try:
+        d = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return ""
+    return f"{d.year}-{d.month:02d}-{d.day:02d} {d.hour:02d}:{d.minute:02d}"
 
 
 def paint_titlebar(win, caption: str, text_color: str) -> bool:
@@ -254,6 +318,11 @@ class ChatWindow(QWidget):
         # 这儿先建出来是为了「还没发过消息就 _drop_pending」之类的路径不会 AttributeError。
         self._agent_msgs = []
         self._round = 0
+        # 打字动画。挂在窗口上，所以窗口析构时它一起没，不用自己收。
+        self._typing_i = 0
+        self._typing_timer = QTimer(self)
+        self._typing_timer.setInterval(TYPING_MS)
+        self._typing_timer.timeout.connect(self._tick_typing)
 
         # 退出程序时必须把线程收掉，而窗口未必收得到 closeEvent：右键点塔菲 →「退出」
         # 走的是 PetWindow.quit() → QApplication.quit()，聊天窗从没 close() 过。
@@ -318,7 +387,29 @@ class ChatWindow(QWidget):
         row.addWidget(self.btn)
         root.addWidget(bar)
 
+        self.suggests = self._build_suggests()
+        root.addWidget(self.suggests)
+
         self.setStyleSheet(QSS)
+
+    def _build_suggests(self) -> QWidget:
+        """快捷开场那一行。空记录时才有，见 _update_suggests。"""
+        wrap = QWidget()
+        wrap.setObjectName("suggestBar")
+        row = QHBoxLayout(wrap)
+        row.setContentsMargins(14, 0, 14, 10)
+        row.setSpacing(6)
+        for text in SUGGESTS:
+            b = QPushButton(text)
+            b.setObjectName("suggestBtn")
+            b.setCursor(Qt.PointingHandCursor)
+            # 默认参数把 text 绑死在**这一轮**循环的值上。用闭包直接引用 text 的话
+            # 三个按钮最后都发最后那句 —— 经典坑，别改。
+            b.clicked.connect(lambda _checked=False, t=text: self._use_suggest(t))
+            row.addWidget(b)
+        row.addStretch(1)
+        wrap.setVisible(False)         # 由 _update_suggests 定
+        return wrap
 
     def _at_bottom(self) -> bool:
         bar = self.scroll.verticalScrollBar()
@@ -352,19 +443,33 @@ class ChatWindow(QWidget):
         # 插在弹簧前面，否则新消息会跑到下面去
         self.msgs.insertWidget(self.msgs.count() - 1, widget)
 
-    def _apply_width_to(self, bubble) -> None:
-        """只给这一个气泡设 75% 上限。
+    def _limit_w(self) -> int:
+        """一条气泡 / 一行轨迹能占多宽。窗口可以缩放，写死像素必然错。"""
+        return int(self.scroll.viewport().width() * 0.75)
 
-        窗口可以缩放，写死像素必然错，所以按当前视口宽实时算。加一条气泡就全量刷
-        一遍的话是 O(n²)：回填 200 条历史时每条都要遍历一遍已经建出来的所有气泡，
-        实测开窗要 2 秒白屏（原生 5 秒）。新加的那条只需要它自己这一次。
+    def _apply_width_to(self, bubble) -> None:
+        """只给这一个气泡（和它的轨迹行）设 75% 上限。
+
+        加一条气泡就全量刷一遍的话是 O(n²)：回填 200 条历史时每条都要遍历一遍
+        已经建出来的所有气泡，实测开窗要 2 秒白屏（原生 5 秒）。新加的那条只需要
+        它自己这一次。
         """
-        bubble.setMaximumWidth(int(self.scroll.viewport().width() * 0.75))
+        w = self._limit_w()
+        bubble.setMaximumWidth(w)
+        for t in bubble.traces:
+            t.setMaximumWidth(w)
 
     def _apply_bubble_width(self) -> None:
-        """全量刷一遍，只在 resizeEvent 里调 —— 窗口缩放之后所有气泡的上限都得跟着变。"""
+        """全量刷一遍，只在 resizeEvent 里调 —— 窗口缩放之后所有气泡的上限都得跟着变。
+
+        轨迹行得单独找一遍：它们是气泡的**兄弟**（在同一个 holder 的竖排里），
+        不是气泡的子控件，`findChildren(_Bubble)` 一个都够不着。
+        """
+        w = self._limit_w()
         for b in self.area.findChildren(_Bubble):
-            self._apply_width_to(b)
+            b.setMaximumWidth(w)
+        for t in self.area.findChildren(_Trace):
+            t.setMaximumWidth(w)
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
@@ -375,10 +480,24 @@ class ChatWindow(QWidget):
         self._last_day = ""
         for m in self.history:
             self._maybe_day(m.get("ts", ""))
-            self._append_widget(m["content"], m["role"] == "user")
+            bubble = self._append_widget(m["content"], m["role"] == "user",
+                                         m.get("ts", ""))
+            # 重放她当时调过的工具。`trace` 是后加的字段，旧记录里没有 ——
+            # 所以是 .get 不是 []，而且不认的字段必须当没有，不能报错。
+            for line in m.get("trace") or []:
+                self._add_trace(bubble, line)
+        self._update_suggests()
         if not self.history:
             self._append_notice("和 taffy 打个招呼吧喵")
         QTimer.singleShot(0, self._scroll_to_bottom)
+
+    def _update_suggests(self) -> None:
+        """快捷开场只在**一句都没聊过**的时候露面。
+
+        聊过之后还杵在那儿的话，它就不是「帮你开口」而是「占着地方」了。
+        清空记录之后要重新露出来 —— clear_history 会再调一次。
+        """
+        self.suggests.setVisible(not self.history)
 
     def _maybe_day(self, ts: str) -> None:
         """跨天了就插一条日期分隔。同一天连着多少条都只插一次。"""
@@ -398,7 +517,7 @@ class ChatWindow(QWidget):
                           " font-size: 8.5pt; padding: 8px 0 2px 0;")
         self._add(lab)
 
-    def _append_widget(self, text: str, mine: bool):
+    def _append_widget(self, text: str, mine: bool, ts: str = ""):
         """返回那个气泡控件；真正插进布局的是 `bubble._outer`。
 
         Task 5 里「返回的控件」和「插进布局的控件」是同一个。这一轮她那边多了一层
@@ -410,6 +529,9 @@ class ChatWindow(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
         bubble = _Bubble(text, mine)
+        when = full_ts(ts)
+        if when:
+            bubble.setToolTip(when)
         if mine:
             row.addStretch(1)
             row.addWidget(bubble)
@@ -422,9 +544,16 @@ class ChatWindow(QWidget):
                 # 跟着缩放后的立绘走，不写死 56。原图 369×800 缩到 56 高只有 26 宽，
                 # 框成 56×56 的话右边会空出 30px，正好夹在头像和气泡中间把它们推远。
                 avatar.setFixedSize(pm.width(), pm.height())
+            # 她这边是**竖排**：气泡在上，工具轨迹行在下。用户那边没有轨迹，
+            # 也就不需要这一层，直接放气泡。
+            col = QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(3)
+            col.addWidget(bubble)
             row.addWidget(avatar, 0, Qt.AlignTop)
-            row.addWidget(bubble)
+            row.addLayout(col)
             row.addStretch(1)
+            bubble._col = col
         bubble._outer = holder          # 中途要撤销的时候删的是这个，不是 bubble
         self._add(holder)
         # 新气泡也得吃到 75% 上限。只靠 resizeEvent 的话，窗口最后一次缩放之后
@@ -433,6 +562,35 @@ class ChatWindow(QWidget):
         self._apply_width_to(bubble)
         QTimer.singleShot(0, self._scroll_to_bottom)
         return bubble
+
+    def _add_trace(self, bubble, text: str) -> None:
+        r"""在她那条气泡下面补一行「她干了什么」。
+
+        她调工具那几秒里气泡一直显示「…」，屏幕上完全看不出她在忙 —— 和「卡住了」
+        长得一模一样。事后留一行小字，这是「会聊天的套壳」和「真的做了点事的智能体」
+        之间最直观的那条分界。
+
+        **写的是工具返回的那句话本身**，不另编一套措辞：`agent.run` 的返回值已经
+        是「记住了：X」/「现在是…」这种给人看的中文，再抄一份到这儿就是两处要一起改。
+        它同时也是**唯一**诚实的来源 —— 工具没写成功时返回的是「没记住（写不进文件）」，
+        自己编一句「记住了」就成了撒谎。
+        """
+        if bubble is None or not getattr(bubble, "_col", None):
+            return
+        lab = _Trace(text)
+        lab.setObjectName(TRACE_OBJECT)
+        lab.setWordWrap(True)
+        # 左边一条竖线，是「这是旁白不是她说的话」最省事的画法。
+        # 内缩 PAD_X + TAIL_W 让竖线正好落在气泡**正文**的左边缘上 —— 不缩的话
+        # 它会从窗口最左边起，看着像另一条消息而不是这条气泡的注脚（画出来对过）。
+        lab.setStyleSheet(
+            f"color: {DIM.name()}; font-family: 'Microsoft YaHei UI'; font-size: 8.5pt;"
+            f" border-left: 2px solid {BORDER.name()}; padding-left: 8px;")
+        lab.setContentsMargins(PAD_X + TAIL_W, 0, 0, 0)
+        lab.setMaximumWidth(self._limit_w())
+        bubble._col.addWidget(lab)
+        bubble.traces.append(lab)
+        QTimer.singleShot(0, self._scroll_to_bottom)
 
     def _append_notice(self, text: str) -> None:
         lab = QLabel(text)
@@ -453,15 +611,29 @@ class ChatWindow(QWidget):
         # 开着的窗口跨过午夜时，新消息前面也得补一条日期 —— 只在 _render_history 里
         # 插的话，日期分隔会一直停在开窗那天的。
         self._maybe_day(msg["ts"])
-        self._append_widget(text, True)
+        self._append_widget(text, True, msg["ts"])
         chat_store.save(self.history)
+        self._update_suggests()
         self._start_reply()
+
+    def _use_suggest(self, text: str) -> None:
+        """点快捷开场：把那句话填进输入框，然后走**正常那条发送路径**。
+
+        不复用 send() 里那套逻辑，也不绕开它 —— 绕过的话「正在回复时不能重发」
+        那道守卫就失效了。
+        """
+        if self.worker is not None:
+            return
+        self.input.setPlainText(text)
+        self.send()
 
     def _start_reply(self) -> None:
         self.pending_text = ""
-        # 占位符不是内容：`pending_text` 照旧从空开始攒，气泡里先显示个「…」，
+        # 占位符不是内容：`pending_text` 照旧从空开始攒，气泡里先显示个「·」，
         # 首块一到就被 _on_chunk 覆盖掉。
         self.pending = self._append_widget(TYPING, False)
+        self._typing_i = 0
+        self._typing_timer.start()
         # 本轮的工具调用脚手架（她调工具的往返记录）。只在这一次回复内部流转，
         # 每一轮用户发言都从零开始 —— 不重置的话上一轮的工具往返会一直堆在
         # 请求里，越滚越大。
@@ -489,10 +661,10 @@ class ChatWindow(QWidget):
         self._set_busy(True)
 
     def _on_tools(self, calls: list) -> None:
-        """她要求调工具：执行 -> 把往返记进脚手架 -> 带着结果再问一轮。
+        """她要求调工具：执行 -> 记一行轨迹 -> 把往返记进脚手架 -> 带着结果再问一轮。
 
-        注意这条路上**不碰 `pending_text`**：工具往返期间气泡里一直显示「…」，
-        因为她确实还没开始说话。
+        注意这条路上**不碰 `pending_text` 的内容**：工具往返期间气泡里一直是
+        打字动画，因为她确实还没开始说话。
         """
         self._round += 1
         self._agent_msgs.append({
@@ -508,21 +680,44 @@ class ChatWindow(QWidget):
                 "role": "tool", "tool_call_id": c["id"] or f"call_{i}",
                 "content": result,
             })
+            # 轨迹写的是 result 原话（见 _add_trace）。**没写进去的往返不留痕** ——
+            # 界面说「她记住了X」而盘上没这条，比不显示更糟。
+            self._add_trace(self.pending, result)
         # 她调工具那一轮可能先吐了句「让我想想…」再调，那些字已经流进 pending_text 和
         # 气泡了。不在这儿清掉的话，下一轮的字会**接在后面**，而 _on_done 最后是用
         # 完整文本覆盖气泡的 —— 屏幕上会先看到「让我想想…答」，然后跳成「答」。
+        #
+        # 打字动画**不停**：轨迹行冒出来之后她还是一个字没说，屏幕上仍然该是「她在忙」。
         self.pending_text = ""
         if self.pending is not None:
-            self.pending.set_text(TYPING)
+            self.pending.set_text(TYPING, pin=True)
         self.worker = None
         self._launch()
 
     def _on_chunk(self, piece: str) -> None:
         # 只管填字，滚动交给 _on_range_changed —— 气泡长高之后 rangeChanged 才带着
         # 新算出来的 maximum 过来，在这儿读到的永远是旧值（Critical 1）。
+        self._stop_typing()          # 真字到了，不要再拿点去盖它
         self.pending_text += piece
         if self.pending is not None:
             self.pending.set_text(self.pending_text)
+
+    def _tick_typing(self) -> None:
+        r"""走一格打字动画。
+
+        `pending_text` 一旦非空就自己停下 —— 那一刻气泡里已经是她的话了，
+        再往上盖点就成了「说着说着突然变回点」。这条判断比在 `_on_chunk` 里
+        掐定时器更要紧：`_on_tools` 会把 `pending_text` 清回空，那之后动画
+        本来就该继续走。
+        """
+        if self.pending is None or self.pending_text:
+            self._stop_typing()
+            return
+        self._typing_i = (self._typing_i + 1) % len(TYPING_FRAMES)
+        self.pending.set_text(TYPING_FRAMES[self._typing_i], pin=True)
+
+    def _stop_typing(self) -> None:
+        self._typing_timer.stop()
 
     def _on_done(self, full: str) -> None:
         self.worker = None
@@ -530,9 +725,17 @@ class ChatWindow(QWidget):
         if not full.strip():
             self._drop_pending()                 # 用户点了停止，一个字都没吐出来
             return
+        self._stop_typing()
         if self.pending is not None:
             self.pending.set_text(full)          # 用完整文本覆盖，跟落盘的一致
-        self.history.append(chat_store.make("assistant", full))
+        rec = chat_store.make("assistant", full)
+        # 轨迹跟着一起落盘。只写在界面上、不存的话，重开窗口那几行就凭空消失了 ——
+        # 和 `_on_fail` 里那段「半句气泡」的道理完全一样（界面和落盘对不上）。
+        # `build_messages` 只取 role/content，这个额外的键不会进请求。
+        traces = [t.text() for t in (self.pending.traces if self.pending else [])]
+        if traces:
+            rec["trace"] = traces
+        self.history.append(rec)
         chat_store.save(self.history)
         self.pending = None
         # 出声放在最后：挑不出贴切的台词就什么都不播（见 voice.pick）。
@@ -550,6 +753,8 @@ class ChatWindow(QWidget):
         self._append_notice(msg)
 
     def _drop_pending(self) -> None:
+        # 打字动画先停：下面马上要把那个气泡删掉，定时器再走一格就是在碰已删控件。
+        self._stop_typing()
         # 攒的增量也一起清掉 —— 不清的话它会留到下一轮 _start_reply 之前，
         # 谁在这中间碰一下 self.pending_text 就会读到上一轮的残字。
         self.pending_text = ""
@@ -617,6 +822,9 @@ class ChatWindow(QWidget):
         self._drop_pending()
 
     def closeEvent(self, e) -> None:
+        # 定时器在这儿也要停：`_stop_worker` 在没有 worker 时会早退（关窗时常见），
+        # 那时它下面那次 _drop_pending 根本不跑，动画会对着已关的窗口继续走。
+        self._stop_typing()
         self._stop_worker()
         self._save_geometry()
         cfgmod.save(self.cfg)
@@ -677,4 +885,5 @@ class ChatWindow(QWidget):
             item = self.msgs.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self._update_suggests()          # 记录清空了，快捷开场该回来
         self._append_notice("清空了喵，重新开始")
