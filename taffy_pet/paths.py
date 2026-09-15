@@ -50,6 +50,15 @@ CHAT_PATH = DATA_DIR / "chat.json"
 # `voice.py`，没有音频本身。
 VOICE_DIR = DATA_DIR / "voice"
 
+# 跳舞精灵表：一张所有帧横排的 PNG + 一份 dance.json。
+#
+# **和语音库同一个待遇，同样只放用户目录。** 它是从视频素材里逐帧抠出来、
+# 再挑出干净帧拼成的 —— 属于「第三方的画面」那一类，不是这个仓库自己的东西。
+# 仓库里只留读取它的 `pet.py` 和安装它的 `tools/taffy_install_dance.py`。
+#
+# 少了它不影响任何别的东西：菜单里「跳个舞」会灰掉并写明缺什么。
+DANCE_DIR = DATA_DIR / "dance"
+
 
 def persona_path() -> Path:
     """用户改过就用用户的，否则用随包的默认版。

@@ -291,6 +291,70 @@ def test_bounce() -> None:
         print("  FAIL 曲线有跳变，关键帧插值断了")
 
 
+def test_dance() -> None:
+    r"""跳舞：帧号怎么走、循环、收尾，以及跳舞期间**不吃**呼吸/弹跳/眨眼。
+
+    这一段是全套测试里唯一建 `PetAnimator` 的地方 —— 别处都走 `bounce_curve()`
+    那个纯函数。QObject 不需要 QApplication（QWidget 才需要），所以不用起窗口。
+    """
+    print("跳舞：")
+    a = A.PetAnimator()
+    ck("没跳时帧号是 None", a.state()[-1], None)
+    ck("没跳时 dancing 是假", a.dancing, False)
+
+    a.dance(0)
+    ck("给 0 帧不启动", a.dancing, False)
+
+    # 4 帧、10fps、跳 2 遍 —— 每帧 5 个 tick（tick 是 20ms），一共 40 个。
+    a.dance(4, fps=10.0, loops=2)
+    ck("开始跳了", a.dancing, True)
+    ck("第一帧是 0", a.state()[-1], 0)
+    ck("还没跳完", a.bouncing, False)
+
+    # 上限是防「这个舞永远跳不完」—— 真出那种 bug 时，没有上限的话这里会
+    # 死循环，测试挂在那儿不报错，比报错难查得多。（第一版就踩了：
+    # 收尾判断用了取模后的帧号，那个值永远到不了总帧数。）
+    seen = []
+    for _ in range(200):
+        if not a.dancing:
+            break
+        sx, sy, dy, blink, i = a.state()
+        seen.append(i)
+        if (sx, sy, dy, blink) != (1.0, 1.0, 0.0, False):
+            FAILS.append("跳舞期间叠了呼吸/弹跳/眨眼")
+            print(f"  FAIL 跳舞第 {i} 帧的变换是 {(sx, sy, dy, blink)}，应为原值")
+            break
+        a._tick()
+    else:
+        FAILS.append("跳舞不会自己停")
+        print("  FAIL 走了 200 个 tick 还在跳，收尾判断失效了")
+
+    # 渲染节拍(50Hz)比素材帧率(10fps)快，所以同一个帧号会连着出现好几次 ——
+    # 要验的是**换帧的顺序**，不是每一次重绘。第一次写成了 seen[:4]，那是错的：
+    # 前十次重绘本来就都在第 0 帧上。
+    order = [i for k, i in enumerate(seen) if k == 0 or seen[k - 1] != i]
+    ck("换帧的顺序是 0,1,2,3 走两遍", order, [0, 1, 2, 3, 0, 1, 2, 3])
+    ck("帧号封顶在帧数-1", max(seen), 3)
+    print(f"  ok   两遍一共 {len(seen)} 次重绘、{len(order)} 次换帧"
+          f"（4 帧 x 2 遍 x 5 tick = 40）")
+    if not 38 <= len(seen) <= 42:
+        FAILS.append(f"跳舞重绘次数 {len(seen)} 差得离谱")
+        print(f"  FAIL 应该是 40 上下，实际 {len(seen)}")
+    ck("跳完自己停了", a.dancing, False)
+    ck("跳完帧号回到 None", a.state()[-1], None)
+
+    # 跳舞期间点她不该弹 —— 弹跳进度会卡在 0，等舞跳完那一瞬间补跳一下
+    a.dance(4, fps=10.0, loops=1)
+    a.pounce()
+    ck("跳舞期间点击不触发弹跳", a.bouncing, False)
+    a._tick()
+    ck("还是没在弹", a.bouncing, False)
+
+    # 再点一次是从头跳，不是接着跳
+    a.dance(4, fps=10.0, loops=1)
+    ck("重跳回到第 0 帧", a.state()[-1], 0)
+
+
 def run_case(fn) -> None:
     """一个用例炸了别把后面的都带下水。
 
@@ -511,7 +575,7 @@ def _memory_cases(M) -> None:
 def main() -> int:
     for fn in (test_balance, test_apikey, test_persona_path, test_chat_store,
                test_chat_prompt, test_load_persona, test_chat_trim,
-               test_sse_parse, test_bounce, test_voice,
+               test_sse_parse, test_bounce, test_dance, test_voice,
                test_tool_calls, test_agent, test_memory):
         run_case(fn)
     print()

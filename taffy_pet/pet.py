@@ -3,11 +3,14 @@
 点击 = 说话 + 弹余额 + 播音效 + 弹一下。拖拽和点击要靠位移量区分 ——
 否则想挪个位置就会触发一次说话。
 """
+import json
+
 from PyQt5.QtCore import Qt, QRectF, QTimer
 from PyQt5.QtGui import QPainter, QPixmap
 from PyQt5.QtWidgets import QApplication, QInputDialog, QLineEdit, QMenu, QWidget
 
 from . import config as cfgmod
+from . import paths
 from .anim import PetAnimator
 from .balance import BalanceFetcher
 from .paths import ASSETS
@@ -49,13 +52,21 @@ class PetWindow(QWidget):
 
         self.setWindowOpacity(float(cfg.get("opacity", 1.0)))
 
+        self.pix_dance, self.dance_meta, self.dance_fw, self.dance_fh = self._load_dance()
+
         # 目标显示高度是「逻辑像素」。资源本身是高分辨率（见 build_assets.py），
         # 这里按比例缩到 height 逻辑像素 —— 高 DPI 屏上会自动铺满对应的物理像素。
         #
         # 之前这里直接 1:1 把资源画出去，结果 200% 缩放的屏上角色占了整屏 95% 高度，
         # 头被顶到屏幕外，看着像「不在桌面上」。
         self.disp_h = max(40.0, float(cfg.get("height", 200)))
-        self.disp_w = self.pix.width() * self.disp_h / self.pix.height()
+        # 窗口宽度按**所有素材里最宽的那个**定，然后每种素材各自居中画。
+        # 跳舞那几帧她是张开手的，比立绘宽 23%；按立绘定宽的话她一抬手两边就被切掉。
+        # 多出来的那一截是透明像素 —— 透明处点得穿（见 MARGIN_RATIO 的注释），
+        # 代价只是窗口矩形大了十几个像素，不用改窗口大小、不用重算位置。
+        self.sprite_ar = self.pix.width() / self.pix.height()
+        self.dance_ar = (self.dance_fw / self.dance_fh) if self.pix_dance else 0.0
+        self.disp_w = max(self.sprite_ar, self.dance_ar) * self.disp_h
         self.margin = max(6.0, self.disp_h * MARGIN_RATIO)
         self.resize(int(round(self.disp_w + self.margin * 2)),
                     int(round(self.disp_h + self.margin * 2)))
@@ -83,6 +94,49 @@ class PetWindow(QWidget):
             return None
         pm = QPixmap(str(p))
         return pm if not pm.isNull() else None
+
+    def _load_dance(self):
+        r"""载入跳舞精灵表，返回 (像素图, 元数据, 帧宽, 帧高)；缺任何一样就是四个空。
+
+        `%APPDATA%\TaffyPet\dance\` 里的两个文件：
+
+            dance.png    所有帧**横排**在一张图里，带 alpha
+            dance.json   {"frames": 20, "frame_w": 227, "frame_h": 400,
+                          "fps": 15.0, "pingpong": true, ...}
+
+        第 i 帧的取景框就是 `(i * frame_w, 0, frame_w, frame_h)`。
+        `pingpong` 为真表示这张表自带往返，播到头循环回去不会跳 ——
+        这是**出素材那一步**接好的，播放端不用管。
+
+        **读坏了只当没有，不抛异常** —— 跳舞是附加值，不能因为它让桌宠起不来。
+        但损坏和缺失要分开说：文件在而内容不对是用户该知道的事（他可能装错了），
+        文件压根不在是正常的（仓库里本来就不带，见 paths.DANCE_DIR）。
+        """
+        # 走 paths.DANCE_DIR 而不是 `from .paths import DANCE_DIR` —— 跟 voice.py
+        # 一样在**调用时**取。导入时就绑死的话，测试和冒烟脚本就没法把它指到
+        # 临时目录，只能往真实的数据目录里塞东西。
+        d = paths.DANCE_DIR
+        png, meta_p = d / "dance.png", d / "dance.json"
+        if not png.exists() or not meta_p.exists():
+            return None, None, 0, 0
+        pm = self._load(str(png))
+        if pm is None:
+            print(f"[dance] {png} 打不开，这次就不跳舞了")
+            return None, None, 0, 0
+        try:
+            meta = json.loads(meta_p.read_text(encoding="utf-8"))
+            n, fw, fh = (int(meta["frames"]), int(meta["frame_w"]),
+                         int(meta["frame_h"]))
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            print(f"[dance] {meta_p} 读不动（{type(e).__name__}: {e}），这次就不跳舞了")
+            return None, None, 0, 0
+        # 精灵表比元数据说的还小的话，取帧就会取到图外面去（drawPixmap 会拿到
+        # 一块空的，看着像她突然消失）。这种不一致当损坏处理。
+        if n <= 0 or fw <= 0 or fh <= 0 or pm.width() < n * fw or pm.height() < fh:
+            print(f"[dance] 精灵表 {pm.width()}x{pm.height()} 跟 dance.json 说的 "
+                  f"{n} 帧 x {fw}x{fh} 对不上，这次就不跳舞了")
+            return None, None, 0, 0
+        return pm, meta, fw, fh
 
     def _load_sound(self):
         p = ASSETS / "sounds" / "click.wav"
@@ -121,17 +175,31 @@ class PetWindow(QWidget):
 
     # ---------- 绘制 ----------
     def paintEvent(self, _event) -> None:
-        sx, sy, dy, blinking = self.animator.state()
-        src = self.pix_blink if blinking else self.pix
+        sx, sy, dy, blinking, dance_i = self.animator.state()
+
+        if dance_i is None:
+            src = self.pix_blink if blinking else self.pix
+            ar, src_rect = self.sprite_ar, QRectF(src.rect())
+        else:
+            # 从精灵表里取出这一帧。整张表只解码一次（self.pix_dance），
+            # 每帧只是换个取景框 —— 跟立绘同一套画法，不用逐帧解码二十个文件。
+            src = self.pix_dance
+            ar = self.dance_ar
+            src_rect = QRectF(dance_i * self.dance_fw, 0,
+                              self.dance_fw, self.dance_fh)
 
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         w, h = self.width(), self.height()
         m = self.margin
+        # 窗口是按最宽的素材定的，窄的那个要居中画 —— 都靠左的话她会看着偏在
+        # 窗口一边，拖动时手感和落点对不上。
+        dest_w = ar * self.disp_h
+        left = m + (self.disp_w - dest_w) / 2.0
         p.translate(w / 2.0, h - m)           # 锚点：底部中心
         p.scale(sx, sy)
         p.translate(-w / 2.0, -(h - m) + dy * self.disp_h)
-        p.drawPixmap(QRectF(m, m, self.disp_w, self.disp_h), src, QRectF(src.rect()))
+        p.drawPixmap(QRectF(left, m, dest_w, self.disp_h), src, src_rect)
 
     # ---------- 交互 ----------
     def mousePressEvent(self, e) -> None:
@@ -201,6 +269,14 @@ class PetWindow(QWidget):
         m.addAction("清空对话记录", self.clear_chat)
         m.addSeparator()
 
+        dance = m.addAction("跳个舞")
+        # 和「说话出声」同一个处理：没素材就灰掉并写明缺什么，
+        # 而不是让用户点了没反应 —— 在他那边「点了没反应」和「坏了」是一回事。
+        if self.pix_dance is None:
+            dance.setEnabled(False)
+            dance.setText("跳个舞（没装舞蹈素材）")
+        dance.triggered.connect(self.do_dance)
+
         blink = m.addAction("眨眼")
         blink.setCheckable(True)
         blink.setChecked(self.animator.blink_enabled)
@@ -232,6 +308,14 @@ class PetWindow(QWidget):
         self.build_menu().exec_(e.globalPos())
 
     # ---------- 菜单动作 ----------
+    def do_dance(self) -> None:
+        if self.pix_dance is None:
+            return
+        # 帧率来自 dance.json 而不是写死在 anim.py：换一段素材、重新出一张表，
+        # 拍子就该跟着新素材走，不该还按旧的那段跳。
+        self.animator.dance(int(self.dance_meta["frames"]),
+                            float(self.dance_meta.get("fps", 15.0)))
+
     def _set_blink(self, on: bool) -> None:
         self.cfg["blink"] = bool(on)
         self.animator.set_blink_enabled(bool(on))

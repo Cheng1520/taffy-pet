@@ -31,10 +31,13 @@ def check_bounds(pet) -> bool:
 
     解析地算，不依赖渲染 —— 截图看不出「小了一点」是设计还是 bug。
     """
-    # 用实际绘制尺寸而不是资源像素 —— 资源是高分辨率的，和屏幕上的大小不是一回事
-    pw, ph = pet.disp_w, pet.disp_h
+    # 用实际绘制尺寸而不是资源像素 —— 资源是高分辨率的，和屏幕上的大小不是一回事。
+    # 立绘画的是 pet.sprite_ar 那个宽度，不是窗口宽（窗口按最宽素材定，见 pet.py）。
+    pw, ph = pet.sprite_ar * pet.disp_h, pet.disp_h
     win_w, win_h = pet.width(), pet.height()
     M = pet.margin
+    # 每种素材都是水平居中画的（pet.py 的 left），所以中心永远是窗口中线
+    cx = win_w / 2.0
     ok = True
 
     worst = {"left": float("inf"), "right": float("-inf"),
@@ -44,8 +47,8 @@ def check_bounds(pet) -> bool:
         # 锚点是底部中心；加上呼吸的最坏偏移
         sy += animmod.BREATH_AMP
         half = pw / 2.0 * sx
-        worst["left"] = min(worst["left"], M + pw / 2.0 - half)
-        worst["right"] = max(worst["right"], M + pw / 2.0 + half)
+        worst["left"] = min(worst["left"], cx - half)
+        worst["right"] = max(worst["right"], cx + half)
         worst["top"] = min(worst["top"], M + ph - ph * sy + dy * ph)
         worst["bottom"] = max(worst["bottom"], M + ph + dy * ph)
         lo_sy, hi_sy = min(lo_sy, sy), max(hi_sy, sy)
@@ -68,6 +71,20 @@ def check_bounds(pet) -> bool:
     if squash < 0.05:
         print("  ✗ 压扁幅度不足 5%，等于没动 —— 调大 BOUNCE_KEYS 里 0.13 那帧")
         ok = False
+
+    # 跳舞帧是横着最宽的一种素材，它就是窗口宽度该定多宽的依据。
+    # 这条断言守的是「她一抬手，手被窗口切掉」—— 那正是把窗口宽度改成
+    # 取最宽素材的直接原因，得有个东西盯着它别退化回去。
+    if pet.pix_dance is None:
+        print("  - 没装舞蹈素材，跳过跳舞取景检查")
+    else:
+        dw = pet.dance_ar * pet.disp_h
+        if dw > win_w:
+            print(f"  ✗ 跳舞帧宽 {dw:.1f} 超出窗口 {win_w}，她会缺手")
+            ok = False
+        else:
+            print(f"  ✓ 跳舞取景：单帧 {dw:.1f}x{pet.disp_h:.1f}"
+                  f"（窗口宽 {win_w}，还剩 {(win_w - dw) / 2:.1f}px 边距）")
     return ok
 
 
@@ -140,6 +157,19 @@ def main() -> int:
 
     def shot_toast():
         pet.toast.grab().save(str(out.with_name("_smoke_toast.png")))
+        if pet.pix_dance is None:
+            print(f"截图已保存到 {out.parent}/_smoke*.png")
+            app.quit()
+            return
+        pet.do_dance()
+        # 取中段那一帧 —— 头几帧的站姿跟立绘差不多，看截图分不出画的是不是
+        # 精灵表里的东西，那这张截图就白拍了。
+        mid = pet.dance_meta["frames"] * 5 / 2 / float(pet.dance_meta.get("fps", 15.0))
+        QTimer.singleShot(int(mid * 1000), shot_dance)
+
+    def shot_dance():
+        pet.grab().save(str(out.with_name("_smoke_dance.png")))
+        print(f"  ✓ 跳舞第 {pet.animator.frame_index()} 帧已截图")
         print(f"截图已保存到 {out.parent}/_smoke*.png")
         app.quit()
 
