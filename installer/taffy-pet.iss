@@ -80,6 +80,20 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"
 ; 少一个 DLL 就是启动即崩，而且崩得没头没尾。
 Source: "..\dist\TaffyPet\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+; 语音库和跳舞精灵表**不进版本库**（见仓库 .gitignore 的 /voice/ 和 /dance/），
+; 但必须进安装包 —— 要的就是「GitHub 上发出去的安装包装完和本机一致」。
+; 仓库里只留读它们的代码（taffy_pet\voice.py、pet.py）和装它们的脚本。
+;
+; 目的地是 {userappdata}，也就是 %APPDATA%\TaffyPet\ —— 桌宠运行时从那儿读
+; （paths.py 的 VOICE_DIR / DANCE_DIR）。**不能放进 {app}**：打包之后 DATA_DIR
+; 固定指 %APPDATA%\TaffyPet，放安装目录里她一个字节都不会去找。
+;
+; 这两个目录是构建前手工准备好的（tools 里那两个 taffy_install_*.py 负责生成并
+; 同时装到本机两份）。缺了它们 ISCC 会直接报错停下 —— 那是好事，比打出个
+; 装完没声音的包发出去强。
+Source: "..\voice\*"; DestDir: "{userappdata}\TaffyPet\voice"; Flags: ignoreversion
+Source: "..\dance\*"; DestDir: "{userappdata}\TaffyPet\dance"; Flags: ignoreversion
+
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Tasks: desktopicon
@@ -87,8 +101,13 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app
 [Run]
 Description: "立刻把塔菲叫出来"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
-; 卸载时刻意不删 %APPDATA%\TaffyPet —— 那里面有用户填的 API Key。
-; 重装一次还要重新贴 Key 是最招人烦的失败方式。想彻底清干净就手动删掉那个目录。
+; 卸载**绝不能**把 %APPDATA%\TaffyPet 整个删掉 —— 那里面有用户填的 API Key 和
+; 聊天记录。重装一次还要重新贴 Key 是最招人烦的失败方式。想彻底清干净就手动删。
+;
+; 语音库和精灵表现在也装在那儿（见 [Files]），它们会被卸载器带走 —— 那是
+; Inno 按自己的安装清单删的，只删它装进去的那几个文件，config.json / chat.json /
+; memory.md 一个都不碰。**别为了「顺手清干净」把 {userappdata}\TaffyPet 加进
+; [UninstallDelete]**：那条按目录删，会把 API Key 一起带走。
 
 [UninstallDelete]
 ; 程序自己可能往安装目录里落东西（老版本的 config.json / taffy.log 就走这儿），
