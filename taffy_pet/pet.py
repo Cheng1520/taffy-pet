@@ -12,6 +12,7 @@ from .anim import PetAnimator
 from .balance import BalanceFetcher
 from .paths import ASSETS
 from .toast import Toast
+from .voice import Voice
 
 # 边距是角色显示高度的比例，不是固定像素 —— 角色的放大/弹跳都是按比例缩放的，
 # 固定边距在角色调小之后会显得过大、调大之后又不够。
@@ -70,6 +71,9 @@ class PetWindow(QWidget):
         self.animator.start()
 
         self._sound = self._load_sound()
+        # 语音库归 Pet 持有，聊天窗只管调用 —— 音量配置只有一份（cfg["volume"]），
+        # 两处各建一个播放器的话改音量就会只改到一半。
+        self.voice = Voice(self.cfg)
         self._restore_pos()
 
     # ---------- 载入 ----------
@@ -210,6 +214,16 @@ class PetWindow(QWidget):
         top.setChecked(bool(self.cfg.get("always_on_top", True)))
         top.toggled.connect(self.set_always_on_top)
 
+        say = m.addAction("说话出声")
+        say.setCheckable(True)
+        say.setChecked(bool(self.cfg.get("voice", True)))
+        # 没有语音库就把这一项灰掉并说明原因，而不是让用户点了没反应 ——
+        # 「点了没反应」和「功能坏了」在他的角度是一回事。
+        if not self.voice.entries:
+            say.setEnabled(False)
+            say.setText("说话出声（没装语音库）")
+        say.toggled.connect(self._set_voice)
+
         m.addSeparator()
         m.addAction("退出", self.quit)
         return m
@@ -223,6 +237,14 @@ class PetWindow(QWidget):
         self.animator.set_blink_enabled(bool(on))
         cfgmod.save(self.cfg)
 
+    def _set_voice(self, on: bool) -> None:
+        self.cfg["voice"] = bool(on)
+        cfgmod.save(self.cfg)
+        # 打开时给一声反馈：不然用户不知道该不该相信它生效了。
+        # 关掉时**不播** —— 刚说「别出声」又响一下是最容易让人上火的细节。
+        if on:
+            self.voice.play("在呢在呢")
+
     def set_always_on_top(self, on: bool) -> None:
         self.cfg["always_on_top"] = bool(on)
         flags = self.windowFlags()
@@ -235,7 +257,7 @@ class PetWindow(QWidget):
         """已经开着就叫到前面，不要再开一个。"""
         if getattr(self, "chat", None) is None:
             from .chat_window import ChatWindow
-            self.chat = ChatWindow(self.cfg)
+            self.chat = ChatWindow(self.cfg, voice=self.voice)
         self.chat.show_and_raise()
 
     def edit_persona(self) -> None:

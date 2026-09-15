@@ -18,8 +18,20 @@ config.json.tmp
 # 但 `git check-ignore assets/persona.md` 会报「被忽略」，看着像出了事）。
 /persona.md
 
+# 她的长期记忆（「记住」工具写的）。源码方式运行时同样落在仓库根，
+# 里面是用户跟她说过的私事 —— 和 chat.json 一个性质，绝不能提交。
+# 前导斜杠的理由见上一条。
+/memory.md
+/memory.md.tmp
+
 # 崩溃时写的堆栈，机器相关，不进版本库
 taffy.log
+
+# 语音库：克隆真人声音的产物（预渲染 wav + index.json），只做本机自用，
+# 和 API Key 同一个待遇 —— 既不分发也不进版本库。
+# 前导斜杠同样是有意的：只匹配仓库根这份（源码方式运行时 DATA_DIR 就是仓库根），
+# 别把将来可能放进 assets/ 的随包音效一起匹配掉。
+/voice/
 
 __pycache__/
 *.py[cod]

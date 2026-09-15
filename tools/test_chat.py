@@ -15,6 +15,14 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# 控制台是 GBK 时打印中文会抛 UnicodeEncodeError，被用例接住后报成假失败。
+# 把这个进程的 stdout 掰成 UTF-8，别要求用户记得加 PYTHONUTF8=1。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
 # 本机装了 Watt Toolkit，系统代理（Windows 注册表）会被 requests 认下来，
 # 连发往 127.0.0.1 的请求都会被劫持成 404。这里绕开它。
 # 只改测试，不动产品代码 —— ChatWorker 对着真接口走代理是对的，跟 balance.py 一样。
@@ -49,15 +57,30 @@ class Handler(BaseHTTPRequestHandler):
     delay = 0.0
     no_final_newline = False  # 末行不补尾换行、也不发 [DONE]（末行冲刷那个用例）
     gate = None               # 发完第一行后卡在这个 Event 上（真流式那个用例）
-    seen = {}                 # 收到的请求，留给测试断言
+    seen = {}                 # 最近一次收到的请求，留给测试断言
+    # 每一次请求按顺序留一份。智能体的多轮要拿第一轮和第二轮**分别**看，
+    # 只看「最近一次」的话第一轮长什么样就再也验不了了。
+    seen_all = []
     protocol_version = "HTTP/1.1"              # 不开这个的话 body 会一次读完，分块测不到
 
     def log_message(self, *a):
         pass                                   # 别把请求日志刷到屏幕上
 
+    # 想整段换掉响应体时设成 (bytes, 原始字符串)。工具调用那条路径要的是
+    # 完全不同的 SSE 形状（delta 里是 tool_calls 而不是 content），
+    # 塞进 PIECES 那套正文模板里只会把模板搞乱。
+    body_override = None
+    # 按请求顺序逐条取用，取完（或没设）就回落到正常模板。智能体的多轮要的就是这个：
+    # 第一轮回工具调用、第二轮才回正文，用单个 override 表达不了。
+    body_sequence = None
+
     def _body(self) -> bytes:
         """拼 SSE 响应体。no_final_newline 时末行不补换行也不发 [DONE] ——
         那一行会留在 ChatWorker 的缓冲里，只有流结束时的强制冲刷才捞得出来。"""
+        if self.body_override is not None:
+            return self.body_override
+        if self.body_sequence:
+            return self.body_sequence.pop(0)
         out = b""
         for i, p in enumerate(PIECES):
             line = "data: " + json.dumps({"choices": [{"delta": {"content": p}}]},
@@ -94,6 +117,7 @@ class Handler(BaseHTTPRequestHandler):
                             "auth": self.headers.get("Authorization")}
         except (ValueError, UnicodeDecodeError):
             Handler.seen = {"json": {}, "auth": self.headers.get("Authorization")}
+        Handler.seen_all.append(Handler.seen)
 
         if self.status != 200:
             body = b'{"error":"stub"}'
@@ -180,6 +204,20 @@ def _sse(text: str) -> bytes:
                                   ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
+def tool_sse(*deltas) -> bytes:
+    """把一串 delta 拼成工具调用的 SSE 响应体。
+
+    **分块形状是照抄真接口的**：第一个分块的 delta 里同时有 index/id/type/
+    function.name 和一个**空的** arguments，后面的分块只带 index 和 arguments 的碎片。
+    按「一次到齐」造数据的话，ToolCalls 里那段跨块拼接就永远测不到。
+    """
+    out = b""
+    for d in deltas:
+        out += ("data: " + json.dumps({"choices": [{"delta": d}]},
+                                      ensure_ascii=False) + "\n\n").encode("utf-8")
+    return out + b"data: [DONE]\n\n"
+
+
 def cut_inside(text: str) -> bytes:
     """把一条完整的 SSE 行砍在 text 第一个字的中间（只留它的头一个字节）。
 
@@ -197,7 +235,7 @@ def run_worker(worker, timeout_ms=8000, stop_after_ms=None, on_chunk=None):
     on_chunk 会在每收到一个增量之后被叫一次（信号是队列连接，跑在主线程里）。
     """
     loop = QEventLoop()
-    got = {"chunks": [], "done": None, "fail": None}
+    got = {"chunks": [], "done": None, "fail": None, "tools": None}
 
     def take_chunk(text):
         got["chunks"].append(text)
@@ -207,6 +245,10 @@ def run_worker(worker, timeout_ms=8000, stop_after_ms=None, on_chunk=None):
     worker.chunk.connect(take_chunk)
     worker.done.connect(lambda t: (got.__setitem__("done", t), loop.quit()))
     worker.fail.connect(lambda t: (got.__setitem__("fail", t), loop.quit()))
+    # tool_calls 和 done 是互斥的两个收尾信号，谁先到就收谁的 —— 这条连接对
+    # 不用工具的用例完全无害（那些用例它永远不会发）。
+    worker.tool_calls.connect(
+        lambda c: (got.__setitem__("tools", c), loop.quit()))
     QTimer.singleShot(timeout_ms, loop.quit)
     if stop_after_ms is not None:
         QTimer.singleShot(stop_after_ms, worker.stop)
@@ -237,6 +279,40 @@ def main() -> int:
         ck("temperature 传对了", sent.get("temperature"), CH.TEMPERATURE)
         ck("开着流式", sent.get("stream"), True)
         ck("带上了 Key", Handler.seen.get("auth"), "Bearer sk-test")
+
+        print("工具调用（跨分块拼参数）：")
+        # 真接口的形状：name/id 在第一块，arguments 是后来一段段拼出来的 JSON。
+        Handler.body_override = tool_sse(
+            {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                             "function": {"name": "remember", "arguments": ""}}]},
+            {"tool_calls": [{"index": 0, "function": {"arguments": '{"fact":'}}]},
+            {"tool_calls": [{"index": 0, "function": {"arguments": ' "用户爱熬夜"}'}}]},
+        )
+        got = run_worker(CH.ChatWorker(
+            "sk-test", [{"role": "user", "content": "记住我爱熬夜"}],
+            tools=[{"type": "function",
+                    "function": {"name": "remember", "parameters": {}}}]))
+        Handler.body_override = None
+        ck("收到的是工具调用", got["tools"], [
+            {"id": "call_1", "name": "remember", "arguments": '{"fact": "用户爱熬夜"}'}])
+        # 两个收尾信号互斥：发了 tool_calls 就不能再发 done，
+        # 否则上层得自己猜「这次是哪种」，猜漏了就卡在一个空气泡上。
+        ck("没有同时发 done", got["done"], None)
+        ck("没有报错", got["fail"], None)
+
+        print("不用工具时请求里不带 tools：")
+        # tools 只在开着智能体的时候传。无条件带上会让每次请求都多烧一截
+        # 工具说明的 token，而且模型会开始莫名地调工具。
+        Handler.seen = {}
+        run_worker(CH.ChatWorker("sk-test", [{"role": "user", "content": "x"}]))
+        ck("不传 tools 时请求体里没有这个键",
+           "tools" in (Handler.seen.get("json") or {}), False)
+        Handler.seen = {}
+        run_worker(CH.ChatWorker("sk-test", [{"role": "user", "content": "x"}],
+                                 tools=[{"type": "function", "function": {"name": "now"}}]))
+        ck("传了 tools 就带上",
+           (Handler.seen.get("json") or {}).get("tools"),
+           [{"type": "function", "function": {"name": "now"}}])
 
         print("真流式（边收边吐）：")
         gate = threading.Event()

@@ -10,6 +10,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# 控制台是 GBK 时，下面那些 ✓ 会直接把脚本打挂（UnicodeEncodeError 不是警告，
+# 是崩）。把这个进程的 stdout 掰成 UTF-8，别要求用户记得加 PYTHONUTF8=1。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
 from PyQt5.QtCore import Qt, QTimer  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 
@@ -63,6 +71,27 @@ def check_bounds(pet) -> bool:
     return ok
 
 
+def check_voice(pet) -> None:
+    r"""语音库能不能真加载 —— **这块 test_units 故意不测**。
+
+    `_preload()` 要真建 QSoundEffect，而单元测试里没有 QApplication。
+    可「QSoundEffect 建不起来」恰恰是最可能出问题的一步（QtMultimedia 缺后端、
+    wav 格式不认），所以放到冒烟测试里过一遍真 Qt。
+
+    没有语音库**不算失败** —— 语音是附加值，仓库里本来就不带音频。
+    """
+    v = pet.voice
+    if not v.entries:
+        print(r"  - 没装语音库（%APPDATA%\TaffyPet\voice\），跳过")
+        return
+    print(f"  ✓ 索引 {len(v.entries)} 条，建起 {len(v._effects)} 个播放器")
+    if len(v._effects) != len(v.entries):
+        print("  ✗ 有条目没能建成播放器（wav 格式不认？）")
+    hit = v.pick("别熬夜了，早点睡")
+    print(f"  ✓ 「别熬夜了」-> {hit['file'] if hit else '没挑到'}")
+    print(f"  ✓ 无关的话 -> {v.pick('今天天气不错') or '没挑到（对）'}")
+
+
 def main() -> int:
     out = ROOT / "assets" / "_smoke.png"
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
@@ -74,6 +103,9 @@ def main() -> int:
 
     print("边界检查：")
     bounds_ok = check_bounds(pet)
+
+    print("语音检查：")
+    check_voice(pet)
 
     print("菜单检查：")
     try:

@@ -12,6 +12,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# 控制台默认是 GBK 时，打印「¥」「（余额不足）」这类字符会抛 UnicodeEncodeError，
+# 被 run_case 接住后报成「test_balance 不该抛异常」—— **假的失败**，代码本身没问题。
+# 直接把这个进程的 stdout 掰成 UTF-8，别要求用户记得加 PYTHONUTF8=1。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
 from taffy_pet import anim as A            # noqa: E402
 from taffy_pet import config as C          # noqa: E402
 from taffy_pet.balance import format_balance  # noqa: E402
@@ -297,10 +306,213 @@ def run_case(fn) -> None:
         ck(f"{fn.__name__} 不该抛异常", f"{type(e).__name__}: {e}", None)
 
 
+def test_voice() -> None:
+    r"""语音库的读取与匹配。
+
+    只测 `read_index` 和 `pick` 这两块纯逻辑 —— 真正碰 QtMultimedia 的
+    `_preload` 要 QApplication，留给 tools/smoke.py。
+    """
+    import json
+    import tempfile
+
+    from taffy_pet import config as C
+    from taffy_pet.voice import read_index, MIN_TRIGGER
+
+    print("语音库：")
+    # load() 拿 DEFAULTS 当白名单：不在这儿的话，「关掉语音」存得进文件却在
+    # 下次启动被丢掉，表现是关不掉的语音。这条断言就是拦这个的。
+    ck("voice 在 DEFAULTS 白名单里", "voice" in C.DEFAULTS, True)
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "a.wav").write_bytes(b"x")
+        (d / "b.wav").write_bytes(b"x")
+
+        (d / "index.json").write_text(json.dumps([
+            {"file": "a.wav", "text": "别熬夜了喵。", "triggers": ["熬夜", "了"]},
+            {"file": "b.wav", "text": "好哦。", "triggers": ["好哦"]},
+            {"file": "没了.wav", "text": "文件被删了", "triggers": ["xx"]},
+            {"file": "c.wav", "text": "缺 triggers"},
+            "这不是 dict",
+        ], ensure_ascii=False), encoding="utf-8")
+
+        es = read_index(d)
+        ck("跳过缺文件的条目", [e["file"] for e in es], ["a.wav", "b.wav"])
+        ck("滤掉单字触发词", es[0]["triggers"], ["熬夜"])
+
+        # 绕开 __init__ 直接塞 entries：pick 只用 entries，不碰 Qt
+        from taffy_pet.voice import Voice
+        v = Voice.__new__(Voice)
+        v.entries = es
+
+        ck("挑得出", (v.pick("别熬夜了，早点睡") or {}).get("file"), "a.wav")
+        ck("挑不出返回 None", v.pick("今天天气不错"), None)
+        ck("MIN_TRIGGER 是 2", MIN_TRIGGER, 2)
+
+        # 最长触发词优先：「好哦」比「熬夜」不适用，构造一个两条都撞得上的
+        v.entries = [
+            {"file": "a.wav", "triggers": ["睡觉", "睡觉吧"]},
+            {"file": "b.wav", "triggers": ["睡觉吧现在"]},
+        ]
+        ck("最长触发词胜出", v.pick("你睡觉吧现在")["file"], "b.wav")
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "index.json").write_text("{ 坏掉的 json", encoding="utf-8")
+        ck("坏索引不抛、返回空", read_index(td), [])
+    ck("没有索引返回空", read_index(Path(tempfile.gettempdir()) / "绝对没有这个目录"), [])
+
+
+def test_tool_calls() -> None:
+    r"""流式 tool_call 的碎片拼接。
+
+    这条路径最容易坏：调用的 `name` 和 `id` 在第一块里、`arguments` 是一段段
+    拼出来的 JSON，跨好几个分块。拼错了的表现是**参数被静默截断**
+    （比如记住的内容只剩前半句），不报错、只有结果不对。
+    """
+    from taffy_pet.chat import ToolCalls
+
+    print("工具调用碎片拼接：")
+
+    def feed(*deltas):
+        t = ToolCalls()
+        for d in deltas:
+            t.feed(d)
+        return t.result()
+
+    # 标准情形：一个调用，arguments 被切成三段
+    got = feed(
+        {"tool_calls": [{"index": 0, "id": "call_a", "type": "function",
+                         "function": {"name": "remember", "arguments": ""}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": "{\"fact\": \"用"}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": "户爱熬夜\"}"}}]},
+    )
+    ck("拼出一个调用", len(got), 1)
+    ck("名字对", got[0]["name"], "remember")
+    ck("id 对", got[0]["id"], "call_a")
+    ck("参数拼完整了", got[0]["arguments"], '{"fact": "用户爱熬夜"}')
+
+    # 两个调用交错着来：必须按 index 各归各的，不能串
+    got = feed(
+        {"tool_calls": [{"index": 0, "id": "a",
+                         "function": {"name": "remember", "arguments": "{"}},
+                        {"index": 1, "id": "b",
+                         "function": {"name": "now", "arguments": ""}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]},
+    )
+    ck("两个调用都认出来了", [c["name"] for c in got], ["remember", "now"])
+    ck("按 index 排序", [c["id"] for c in got], ["a", "b"])
+    ck("各自拼各自的", [c["arguments"] for c in got], ["{}", ""])
+
+    # 脏块：没有 index、不是 dict、没有 name —— 都不能炸，也不能冒出半个调用
+    ck("没有 index 当 0", [c["name"] for c in feed(
+        {"tool_calls": [{"id": "x", "function": {"name": "now"}}]})], ["now"])
+    ck("tool_calls 不是列表就忽略", feed({"tool_calls": "乱来"}), [])
+    ck("元素不是 dict 就跳过", feed(
+        {"tool_calls": ["乱来", {"index": 0, "function": {"name": "now"}}]}),
+       [{"id": "", "name": "now", "arguments": ""}])
+    ck("没有 name 的残块丢掉", feed(
+        {"tool_calls": [{"index": 0, "id": "x", "function": {"arguments": "{}"}}]}),
+       [])
+    ck("没有 tool_calls 的 delta 无害", feed({"content": "在呢"}), [])
+
+
+def test_agent() -> None:
+    print("工具执行：")
+    from taffy_pet import agent as A
+
+    ck("工具名是 ASCII（中文名会被接口拒）",
+       [n for n in A.names() if not n.isascii()], [])
+    # 跟 voice 同一个坑：不在 DEFAULTS 里的键，load() 会静默丢掉，
+    # 表现是「智能体开关关不掉」。
+    ck("agent 在 DEFAULTS 白名单里", "agent" in C.DEFAULTS, True)
+
+    # `remember` 会真的往 MEMORY_PATH 落盘。源码方式运行时那指向仓库根，
+    # 不挡住的话这批断言会写进**用户自己的记忆文件**里。
+    import tempfile
+
+    from taffy_pet import memory as M
+    saved = M.MEMORY_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            M.MEMORY_PATH = Path(td) / "memory.md"
+
+            # 参数形状不可控，任何形状都不能抛
+            ck("参数不是 dict", "没记住" in A.run("remember", "半截 json"), True)
+            ck("参数是 None", "没记住" in A.run("remember", None), True)
+            ck("不认识的工具不抛", "没有叫" in A.run("乱来", {}), True)
+            ck("now 给得出时间", "现在是" in A.run("now", {}), True)
+            ck("now 带了星期", "星期" in A.run("now", {}), True)
+
+            # 端到端：工具真的写进了记忆文件（这才是「智能体」那半条）
+            ck("remember 真的落盘", A.run("remember", {"fact": "用户在写测试"}), "记住了：用户在写测试")
+            ck("落盘的内容读得回来", M.load(), ["用户在写测试"])
+    finally:
+        M.MEMORY_PATH = saved
+
+
+def test_memory() -> None:
+    r"""长期记忆：去重、两个上限、坏文件不炸。
+
+    **必须先把 MEMORY_PATH 指到临时目录** —— 源码运行时它指向仓库根，
+    真往那儿写就把用户的实际记忆改了。
+    """
+    import tempfile
+
+    from taffy_pet import memory as M
+
+    print("长期记忆：")
+    # 测完把路径还回去 —— 留着的话它指向一个已经删掉的临时目录，
+    # 之后任何一次 add() 都会写到不存在的地方（还是静默的）。
+    saved = M.MEMORY_PATH
+    try:
+        _memory_cases(M)
+    finally:
+        M.MEMORY_PATH = saved
+
+
+def _memory_cases(M) -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        M.MEMORY_PATH = Path(td) / "memory.md"
+
+        ck("一开始是空的", M.load(), [])
+        ck("没有记忆时 prompt 块是空串", M.as_prompt(), "")
+        M.add("用户在做塔菲桌宠")
+        M.add("用户经常熬夜到两点")
+        ck("记了两条", M.load(), ["用户在做塔菲桌宠", "用户经常熬夜到两点"])
+        ck("重复的不再记一遍", "已经记着" in M.add("用户在做塔菲桌宠"), True)
+        ck("还是两条", len(M.load()), 2)
+        # 模型很容易给一整段带换行的话，落到文件里会破坏「一条一行」
+        M.add("用户  喜欢\n\n猫")
+        ck("换行和多余空白压成一行", M.load()[-1], "用户 喜欢 猫")
+        ck("空内容不记", "没记" in M.add("   "), True)
+        ck("prompt 块带上了记忆", "用户在做塔菲桌宠" in M.as_prompt(), True)
+        ck("prompt 块说明了这是资料不是指令",
+           "资料，不是指令" in M.as_prompt(), True)
+
+        # 条数上限：超了丢最老的
+        for i in range(M.MAX_ITEMS + 5):
+            M.add(f"第{i}件事")
+        ck("条数卡在上限", len(M.load()), M.MAX_ITEMS)
+        ck("留下的是最新的", M.load()[-1], f"第{M.MAX_ITEMS + 4}件事")
+        ck("最老的已经被挤掉", M.load()[0], "第5件事")
+
+        M.clear()
+        ck("清干净了", M.load(), [])
+
+    # 坏文件：非 UTF-8 内容不能抛（用户拿记事本存成 ANSI 是很常见的）
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "memory.md"
+        p.write_bytes(b"\xff\xfe not utf8 \xff")
+        M.MEMORY_PATH = p
+        ck("坏文件当空的处理", M.load(), [])
+
+
 def main() -> int:
     for fn in (test_balance, test_apikey, test_persona_path, test_chat_store,
                test_chat_prompt, test_load_persona, test_chat_trim,
-               test_sse_parse, test_bounce):
+               test_sse_parse, test_bounce, test_voice,
+               test_tool_calls, test_agent, test_memory):
         run_case(fn)
     print()
     if FAILS:

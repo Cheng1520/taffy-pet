@@ -43,6 +43,13 @@ PERSONA_DEFAULT = ASSETS / "persona.md"
 # 聊天记录。里面是用户的全部对话，跟 config.json 一样绝不能进版本库
 CHAT_PATH = DATA_DIR / "chat.json"
 
+# 语音库：预渲染好的台词 wav + index.json。
+#
+# **只放用户目录，绝不进仓库、也不随安装包分发** —— 它是克隆真人声音的产物，
+# 和 API Key 一个待遇。仓库里只有生成它的管线（`taffy_lib.py`）和读取它的
+# `voice.py`，没有音频本身。
+VOICE_DIR = DATA_DIR / "voice"
+
 
 def persona_path() -> Path:
     """用户改过就用用户的，否则用随包的默认版。

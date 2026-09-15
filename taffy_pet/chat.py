@@ -37,8 +37,17 @@ RULES = """\
 4. 用中文回复。"""
 
 
-def build_system_prompt(persona_text: str) -> str:
-    return persona_text.strip() + "\n\n" + RULES
+def build_system_prompt(persona_text: str, memory_text: str = "") -> str:
+    r"""人设 + 硬规则 (+ 她记得的事)。
+
+    **记忆块放在最后，而且排在规则之后** —— 记忆是模型自己写的内容，
+    理论上可以被打字进来的人影响。放在规则之后、并明说「是资料不是指令」，
+    至少不会让它覆盖掉人设。没有记忆就一个字都不加，别塞个空标题。
+    """
+    s = persona_text.strip() + "\n\n" + RULES
+    if memory_text and memory_text.strip():
+        s += "\n\n" + memory_text.strip()
+    return s
 
 
 def load_persona() -> str:
@@ -62,18 +71,28 @@ def trim_history(messages: list) -> list:
     return tail
 
 
-def build_messages(persona_text: str, history: list) -> list:
-    """history 里已经包含用户刚发的那句。"""
-    msgs = [{"role": "system", "content": build_system_prompt(persona_text)}]
+def build_messages(persona_text: str, history: list,
+                   memory_text: str = "", extra: list = None) -> list:
+    """history 里已经包含用户刚发的那句。
+
+    `extra` 是**本轮**的工具调用脚手架（assistant 的 tool_calls + tool 的结果）。
+    它只在一次回复的多轮之间活着，**不进 chat.json** —— 那是给下次开窗回填用的，
+    里面存 tool_call_id 之类的协议细节没有意义，而且会让历史记录读起来莫名其妙。
+    """
+    msgs = [{"role": "system",
+             "content": build_system_prompt(persona_text, memory_text)}]
     msgs += [{"role": m["role"], "content": m["content"]}
              for m in trim_history(history)]
+    msgs += list(extra or [])
     return msgs
 
 
-def parse_sse_lines(buf: str, text: str):
-    """把新到的文本拼进缓冲，切出完整的 SSE 行，抽里面的正文增量。
+def iter_deltas(buf: str, text: str):
+    """切出完整的 SSE 行，返回 (剩下的缓冲, [delta, ...], 切没切出 [DONE])。
 
-    返回 (剩下的缓冲, 这一批的文本, 这一轮切没切出 [DONE]（跨轮要自己累积）)。
+    **分帧和「这块结构对不对」的判断只此一份。** 正文和工具调用是两条消费路径，
+    校验要是各写一份，两边对脏块的处理迟早会不一致 —— 一边跳过、一边抛异常，
+    表现就是「加了工具之后回复偶尔断掉」。
 
     最后那段不完整的行留在缓冲里等下一块 —— 这是整个函数存在的理由。
     """
@@ -103,10 +122,59 @@ def parse_sse_lines(buf: str, text: str):
         delta = choices[0].get("delta") or {}
         if not isinstance(delta, dict):
             continue                       # delta 该是对象，同上
+        out.append(delta)
+    return buf, out, done
+
+
+def parse_sse_lines(buf: str, text: str):
+    """把新到的文本拼进缓冲，抽正文增量（只关心 content 的那条老路径）。
+
+    返回 (剩下的缓冲, 这一批的文本, 这一轮切没切出 [DONE]（跨轮要自己累积）)。
+    """
+    buf, deltas, done = iter_deltas(buf, text)
+    out = []
+    for delta in deltas:
         piece = delta.get("content")
         if piece:
             out.append(piece)              # 首块只有 role 没有 content，这里自然跳过
     return buf, out, done
+
+
+class ToolCalls:
+    """把流式过来的 tool_call 碎片拼回完整的调用。
+
+    工具调用**不是一次到齐的**：`name` 和 `id` 在某个分块里出现，`arguments`
+    是一段一段拼出来的 JSON 字符串，跨好几个分块。所以只能按 `index` 攒，
+    等流结束再一次性交给上层 —— 中途拼出来的半截 JSON 解不动，解了也没用。
+    """
+
+    def __init__(self):
+        self._slots = {}
+
+    def feed(self, delta: dict) -> None:
+        calls = delta.get("tool_calls")
+        if not isinstance(calls, list):
+            return
+        for c in calls:
+            if not isinstance(c, dict):
+                continue
+            i = c.get("index")
+            if not isinstance(i, int):
+                i = 0
+            slot = self._slots.setdefault(i, {"id": "", "name": "", "arguments": ""})
+            if isinstance(c.get("id"), str) and c["id"]:
+                slot["id"] = c["id"]
+            fn = c.get("function")
+            if isinstance(fn, dict):
+                if isinstance(fn.get("name"), str) and fn["name"]:
+                    slot["name"] = fn["name"]
+                if isinstance(fn.get("arguments"), str):
+                    slot["arguments"] += fn["arguments"]
+
+    def result(self) -> list:
+        """按 index 排序返回。没有 name 的丢掉 —— 那是拼坏了的残块，调不了。"""
+        return [self._slots[k] for k in sorted(self._slots)
+                if self._slots[k]["name"]]
 
 
 class ChatWorker(QThread):
@@ -115,11 +183,18 @@ class ChatWorker(QThread):
     chunk = pyqtSignal(str)      # 增量文本
     done = pyqtSignal(str)       # 完整回复（被停止时就是已经收到的部分）
     fail = pyqtSignal(str)       # 给人看的错误说明
+    # 这一轮流结束时她要求调工具（而不是给了一段话）。
+    #
+    # **和 done 是互斥的**：`_run` 结尾只会发其中一个。两个都发的话上层就得
+    # 自己判断「这次是哪种」，而漏判的那一支会让对话卡在一个空气泡上。
+    tool_calls = pyqtSignal(list)
 
-    def __init__(self, api_key: str, messages: list, parent=None):
+    def __init__(self, api_key: str, messages: list, parent=None, tools=None):
         super().__init__(parent)
         self.api_key = api_key
         self.messages = messages
+        # None = 这一轮不带工具（关掉智能体、或者已经是最后一轮收尾）
+        self.tools = tools
         self._stop = False
 
     def stop(self) -> None:
@@ -140,14 +215,17 @@ class ChatWorker(QThread):
             self.fail.emit("还没设置 API Key\n右键点 taffy →「设置 API Key」")
             return
 
+        body = {"model": MODEL, "messages": self.messages,
+                "stream": True, "temperature": TEMPERATURE}
+        if self.tools:
+            body["tools"] = self.tools
         try:
             r = requests.post(
                 API_URL,
                 headers={"Authorization": f"Bearer {self.api_key}",
                          "Content-Type": "application/json",
                          "Accept": "text/event-stream"},
-                json={"model": MODEL, "messages": self.messages,
-                      "stream": True, "temperature": TEMPERATURE},
+                json=body,
                 timeout=TIMEOUT, stream=True)
         except requests.Timeout:
             self.fail.emit("连接超时（网络不通？）")
@@ -172,15 +250,19 @@ class ChatWorker(QThread):
             decoder = codecs.getincrementaldecoder("utf-8")()
             buf = ""
             parts = []
+            calls = ToolCalls()
             for raw in r.iter_content(chunk_size=None):
                 if self._stop:
                     break
                 if not raw:
                     continue
-                buf, out, done = parse_sse_lines(buf, decoder.decode(raw))
-                for piece in out:
-                    parts.append(piece)
-                    self.chunk.emit(piece)
+                buf, deltas, done = iter_deltas(buf, decoder.decode(raw))
+                for delta in deltas:
+                    calls.feed(delta)
+                    piece = delta.get("content")
+                    if piece:
+                        parts.append(piece)
+                        self.chunk.emit(piece)
                 # 收到 [DONE] 这一轮就结束。不 break 的话要靠服务端主动关连接 ——
                 # keep-alive 的连接不会关，客户端会一路挂到 30 秒读超时：回复早显示
                 # 完了，而「停止」按钮还要亮着最多半分钟。
@@ -208,4 +290,11 @@ class ChatWorker(QThread):
         finally:
             r.close()
 
-        self.done.emit("".join(parts))
+        # 她要求调工具 vs 她说了句话 —— **只发一个**，理由见 tool_calls 的定义。
+        # 「点了停止」时 `_stop` 会让循环提前出来，此时 calls 里可能压着**半截**
+        # 参数；但用户已经明确要停了，这一轮就该就地收尾，不要再发起新的调用。
+        found = calls.result() if not self._stop else []
+        if found:
+            self.tool_calls.emit(found)
+        else:
+            self.done.emit("".join(parts))

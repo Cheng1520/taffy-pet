@@ -25,6 +25,13 @@ DEFAULTS = {
     "speech": "关注塔菲喵关注塔菲谢谢喵",
     "hint_shown": False,    # 首次运行提示过操作方式了吗
     "volume": 1.0,
+    # 回复配不配语音。**必须列在这儿** —— load() 拿 DEFAULTS 当白名单，
+    # 不在这儿的话右键关掉语音能存进文件，下次启动却被静默丢掉，
+    # 表现是「关不掉的语音」。跟 chat_geometry 是同一个坑。
+    "voice": True,
+    # 允不允许她自己调工具（查时间、记事）。跟 voice 一个道理，
+    # 不列在这儿的话「关掉智能体」存得进去、下次启动被静默丢掉。
+    "agent": True,
     "pos": None,            # [x, y]，上次退出时的位置
     # 聊天窗口上次的位置和大小。写它的是 chat_window，读它的是 ChatWindow._restore_geometry；
     # 但**读得回来**这件事靠的是这儿有这一项 —— load() 拿 DEFAULTS 当白名单，不在这儿

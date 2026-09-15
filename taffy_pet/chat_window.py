@@ -6,6 +6,7 @@
 """
 import shutil
 import sys
+from datetime import datetime
 
 from PyQt5.QtCore import Qt, QRectF, QTimer
 from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
@@ -13,9 +14,11 @@ from PyQt5.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
                              QMessageBox, QPushButton, QScrollArea,
                              QSizePolicy, QTextEdit, QVBoxLayout, QWidget)
 
+from . import agent
 from . import chat as chatmod
 from . import chat_store
 from . import config as cfgmod
+from . import memory
 from .paths import ASSETS, PERSONA_DEFAULT, PERSONA_PATH
 # 配色只有这一个来源（计划的 Global Constraints）：气泡那四个常量直接引用 toast 的，
 # QSS 里的字面量也从它们拼出来。以前这里是手抄的一份，抄漏了两处 —— 窗口底色和系统
@@ -39,6 +42,17 @@ BTN_BUSY = QColor(185, 174, 180)       # 忙时按钮（灰掉，它现在是「
 BTN_BUSY_HOVER = QColor(169, 158, 164)
 
 AVATAR_H = 56          # 头像立绘的高度；宽度按原图比例走，不固定
+
+# 她还没吐第一个字时气泡里显示的东西。
+#
+# `_start_reply` 先把气泡建出来、首块到了才填字，中间这段时间（DeepSeek 通常 1~3 秒）
+# 屏幕上是一个**空气泡** —— 看着像界面卡住了。给个占位。
+# 别改成「正在输入…」那种长提示：气泡宽度是按内容撑的，一多一少会让整行跳一下。
+TYPING = "…"
+
+# 日期分隔线那个 QLabel 的 objectName。测试靠它把「日期分隔线」和「气泡/系统提示」
+# 分开数（见 tools/test_chat_window.py 的 texts()/rows()），改这个名字要一起改。
+DAY_OBJECT = "daySeparator"
 
 # QSS 里的 {} 是它自己的语法，写在这个 f-string 里得翻倍
 QSS = f"""
@@ -157,6 +171,31 @@ class _Bubble(QWidget):
         p.drawPath(path)
 
 
+def day_label(ts: str) -> str:
+    r"""把一条消息的时间戳变成「今天 / 昨天 / 9月14日」；算不出来返回空串。
+
+    chat.json 里本来就有 `ts`（`chat_store.make` 写的），但渲染时一直没用 ——
+    聊得多了之后「这句是什么时候说的」完全无从判断。
+
+    **解析失败必须返回空串而不是抛**：`ts` 是文件里的字段，用户手改过、
+    或者从旧版本带过来的记录都可能没有它。为了一个日期分隔线让整个窗口打不开，
+    不值得。
+    """
+    try:
+        d = datetime.fromisoformat(ts).date()
+    except (TypeError, ValueError):
+        return ""
+    today = datetime.now().date()
+    delta = (today - d).days
+    if delta == 0:
+        return "今天"
+    if delta == 1:
+        return "昨天"
+    if d.year == today.year:
+        return f"{d.month}月{d.day}日"
+    return f"{d.year}年{d.month}月{d.day}日"
+
+
 def paint_titlebar(win, caption: str, text_color: str) -> bool:
     """把系统标题栏刷成她的粉色。
 
@@ -196,9 +235,12 @@ def paint_titlebar(win, caption: str, text_color: str) -> bool:
 
 
 class ChatWindow(QWidget):
-    def __init__(self, cfg: dict, parent=None):
+    def __init__(self, cfg: dict, parent=None, voice=None):
         super().__init__(parent)
         self.cfg = cfg
+        # 语音库由 Pet 持有（音量只有一份），这儿只拿来播。没有就是不出声，
+        # 其余功能一律照常 —— 语音是附加值，不该成为依赖。
+        self.voice = voice
         self.worker = None
         self.pending = None          # 正在流式填充的那个气泡
         self.pending_text = ""       # 这一轮已经吐出来的字，_on_chunk 往里攒
@@ -206,6 +248,12 @@ class ChatWindow(QWidget):
         # 是不是「贴着底部」。新气泡长高之后要跟着滚，但用户自己往上翻的时候不能
         # 把他拽下来 —— 跟随/不打扰两件事都挂在这一个标志上，见 _on_range_changed。
         self._stick = True
+        # 已经插过的那个日期分隔线的文字。跨天才插新的，不然每条消息前面都顶一个。
+        self._last_day = ""
+        # 本轮工具调用往返的记录和轮次（见 _launch / _on_tools）。_start_reply 会重置，
+        # 这儿先建出来是为了「还没发过消息就 _drop_pending」之类的路径不会 AttributeError。
+        self._agent_msgs = []
+        self._round = 0
 
         # 退出程序时必须把线程收掉，而窗口未必收得到 closeEvent：右键点塔菲 →「退出」
         # 走的是 PetWindow.quit() → QApplication.quit()，聊天窗从没 close() 过。
@@ -324,11 +372,31 @@ class ChatWindow(QWidget):
 
     # ---------- 渲染 ----------
     def _render_history(self) -> None:
+        self._last_day = ""
         for m in self.history:
+            self._maybe_day(m.get("ts", ""))
             self._append_widget(m["content"], m["role"] == "user")
         if not self.history:
             self._append_notice("和 taffy 打个招呼吧喵")
         QTimer.singleShot(0, self._scroll_to_bottom)
+
+    def _maybe_day(self, ts: str) -> None:
+        """跨天了就插一条日期分隔。同一天连着多少条都只插一次。"""
+        lab = day_label(ts)
+        if lab and lab != self._last_day:
+            self._last_day = lab
+            self._append_day(lab)
+
+    def _append_day(self, text: str) -> None:
+        lab = QLabel(text)
+        # 打个标记。日期分隔线是消息区里**第三类**顶层控件（气泡、系统提示之外的），
+        # 测试里数「行数/气泡数」的地方按老口径数的是前两类，没这个标记就得靠
+        # 「今天」这两个字去认，改文案就崩。
+        lab.setObjectName(DAY_OBJECT)
+        lab.setAlignment(Qt.AlignCenter)
+        lab.setStyleSheet(f"color: {DIM.name()}; font-family: 'Microsoft YaHei UI';"
+                          " font-size: 8.5pt; padding: 8px 0 2px 0;")
+        self._add(lab)
 
     def _append_widget(self, text: str, mine: bool):
         """返回那个气泡控件；真正插进布局的是 `bubble._outer`。
@@ -380,23 +448,74 @@ class ChatWindow(QWidget):
         if not text or self.worker is not None:
             return
         self.input.clear()
-        self.history.append(chat_store.make("user", text))
+        msg = chat_store.make("user", text)
+        self.history.append(msg)
+        # 开着的窗口跨过午夜时，新消息前面也得补一条日期 —— 只在 _render_history 里
+        # 插的话，日期分隔会一直停在开窗那天的。
+        self._maybe_day(msg["ts"])
         self._append_widget(text, True)
         chat_store.save(self.history)
         self._start_reply()
 
     def _start_reply(self) -> None:
         self.pending_text = ""
-        self.pending = self._append_widget("", False)
+        # 占位符不是内容：`pending_text` 照旧从空开始攒，气泡里先显示个「…」，
+        # 首块一到就被 _on_chunk 覆盖掉。
+        self.pending = self._append_widget(TYPING, False)
+        # 本轮的工具调用脚手架（她调工具的往返记录）。只在这一次回复内部流转，
+        # 每一轮用户发言都从零开始 —— 不重置的话上一轮的工具往返会一直堆在
+        # 请求里，越滚越大。
+        self._agent_msgs = []
+        self._round = 0
+        self._launch()
+
+    def _launch(self) -> None:
+        """发一轮请求。工具往返时会被连着调好几次，每次都复用同一个占位气泡。"""
+        # 最后一轮不带工具：她要是还想着调工具，这一轮就会被逼着把话说出来，
+        # 而不是无限往返下去。这是 MAX_ROUNDS 之外的第二道闸。
+        use_tools = (bool(self.cfg.get("agent", True))
+                     and self._round < agent.MAX_ROUNDS)
         self.worker = chatmod.ChatWorker(
             cfgmod.api_key(self.cfg),
-            chatmod.build_messages(chatmod.load_persona(), self.history),
-            self)
+            chatmod.build_messages(chatmod.load_persona(), self.history,
+                                   memory.as_prompt(), self._agent_msgs),
+            self,
+            tools=agent.TOOLS if use_tools else None)
         self.worker.chunk.connect(self._on_chunk)
         self.worker.done.connect(self._on_done)
         self.worker.fail.connect(self._on_fail)
+        self.worker.tool_calls.connect(self._on_tools)
         self.worker.start()
         self._set_busy(True)
+
+    def _on_tools(self, calls: list) -> None:
+        """她要求调工具：执行 -> 把往返记进脚手架 -> 带着结果再问一轮。
+
+        注意这条路上**不碰 `pending_text`**：工具往返期间气泡里一直显示「…」，
+        因为她确实还没开始说话。
+        """
+        self._round += 1
+        self._agent_msgs.append({
+            "role": "assistant", "content": "",
+            "tool_calls": [{"id": c["id"] or f"call_{i}", "type": "function",
+                            "function": {"name": c["name"],
+                                         "arguments": c["arguments"]}}
+                           for i, c in enumerate(calls)],
+        })
+        for i, c in enumerate(calls):
+            result = agent.run(c["name"], agent.parse_args(c["arguments"]))
+            self._agent_msgs.append({
+                "role": "tool", "tool_call_id": c["id"] or f"call_{i}",
+                "content": result,
+            })
+        # 她调工具那一轮可能先吐了句「让我想想…」再调，那些字已经流进 pending_text 和
+        # 气泡了。不在这儿清掉的话，下一轮的字会**接在后面**，而 _on_done 最后是用
+        # 完整文本覆盖气泡的 —— 屏幕上会先看到「让我想想…答」，然后跳成「答」。
+        self.pending_text = ""
+        if self.pending is not None:
+            self.pending.set_text(TYPING)
+        self.worker = None
+        self._launch()
 
     def _on_chunk(self, piece: str) -> None:
         # 只管填字，滚动交给 _on_range_changed —— 气泡长高之后 rangeChanged 才带着
@@ -416,6 +535,10 @@ class ChatWindow(QWidget):
         self.history.append(chat_store.make("assistant", full))
         chat_store.save(self.history)
         self.pending = None
+        # 出声放在最后：挑不出贴切的台词就什么都不播（见 voice.pick）。
+        # 也**不给她「说话」的图形状态** —— 音画对不上时那比光出声更假。
+        if self.voice is not None:
+            self.voice.play(full)
 
     def _on_fail(self, msg: str) -> None:
         self.worker = None
@@ -430,6 +553,7 @@ class ChatWindow(QWidget):
         # 攒的增量也一起清掉 —— 不清的话它会留到下一轮 _start_reply 之前，
         # 谁在这中间碰一下 self.pending_text 就会读到上一轮的残字。
         self.pending_text = ""
+        self._agent_msgs = []          # 这一轮废了，工具往返的脚手架也一起扔掉
         if self.pending is not None:
             outer = getattr(self.pending, "_outer", self.pending)
             self.msgs.removeWidget(outer)

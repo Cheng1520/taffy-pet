@@ -35,6 +35,14 @@ import tempfile
 import threading
 from pathlib import Path
 
+# 控制台是 GBK 时打印中文会抛 UnicodeEncodeError，被用例接住后报成假失败。
+# 把这个进程的 stdout 掰成 UTF-8，别要求用户记得加 PYTHONUTF8=1。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
 # 必须在任何 PyQt5 的 import 之前 —— 没有显示器也要能建窗口
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -54,6 +62,7 @@ from taffy_pet import chat as CH                        # noqa: E402
 from taffy_pet import chat_store                        # noqa: E402
 from taffy_pet import chat_window as CW                 # noqa: E402
 from taffy_pet import config as cfgmod                  # noqa: E402
+from taffy_pet import memory                            # noqa: E402
 from taffy_pet import paths                             # noqa: E402
 
 FULL = "".join(TC.PIECES)          # 假接口会吐的完整回复
@@ -80,6 +89,10 @@ def _isolate_paths(tmp: str) -> None:
     cfgmod.CONFIG_PATH = d / "config.json"
     chat_store.CHAT_PATH = d / "chat.json"
     CW.PERSONA_PATH = d / "persona.md"
+    # 记忆文件也要隔离，而且它是最容易漏的一个：她的「记住」工具会在**对话过程中**
+    # 自动落盘，用例不需要显式写文件就会命中 —— 漏掉的话跑一次智能体用例
+    # 就往用户真实的 memory.md 里塞一条测试用的假记忆。
+    memory.MEMORY_PATH = d / "memory.md"
     print(f"  数据落盘隔离到 {tmp}")
 
 
@@ -116,6 +129,10 @@ def texts(win) -> list:
         w = win.msgs.itemAt(i).widget()
         if w is None:
             continue
+        # 日期分隔线不在这套口径里 —— 它是消息区第三类控件，另有 case_day_separator 管。
+        # 不排掉的话，「今天」会被当成一条气泡，所有数数的断言都会平移一格。
+        if w.objectName() == CW.DAY_OBJECT:
+            continue
         bubble = w if isinstance(w, CW._Bubble) else w.findChild(CW._Bubble)
         out.append(bubble.text() if bubble is not None else w.text())
     return out
@@ -130,7 +147,8 @@ def rows(win) -> int:
     只有数行数才看得见（界面上的表现是消息区里多出一块空白）。
     """
     return sum(1 for i in range(win.msgs.count())
-               if win.msgs.itemAt(i).widget() is not None)
+               if (w := win.msgs.itemAt(i).widget()) is not None
+               and w.objectName() != CW.DAY_OBJECT)
 
 
 def pixel(widget, x: int, y: int) -> int:
@@ -269,6 +287,94 @@ def case_send_then_stream() -> None:
        (hist[-1]["role"], hist[-1]["content"]), ("assistant", FULL))
     ck("内存里的历史也一致", win.history[-1]["content"], FULL)
     ck("请求打到了假接口并带上 Key", TC.Handler.seen.get("auth"), "Bearer sk-test")
+    win.close()
+
+
+def _text_body(*pieces: str) -> bytes:
+    """一串正文增量 + [DONE]。跟假接口平时的模板同一种形状。"""
+    out = b""
+    for p in pieces:
+        out += TC._sse(p)
+    return out + b"data: [DONE]\n\n"
+
+
+def case_agent_tool_round() -> None:
+    r"""她调工具那一轮：接口要调工具 → 真的执行 → 结果回填 → 才轮到回复。
+
+    这条**故意走真网络路径**（假接口 + 真 ChatWorker + 真 ChatWindow），
+    而不是直接戳 `_on_tools`。要验的东西全在协议形状上：
+    - 第二轮请求里必须带着第一轮那个 `assistant` 的 `tool_calls`，
+      以及 `tool_call_id` 对得上的 `tool` 结果。少了任何一半，接口都会 400，
+      或者模型根本不知道工具跑过、照着空气回答。
+    - 工具真的执行了（记忆文件里落下了那条），不是只把调用转了一圈。
+    - 界面上只能有**一个**气泡收尾 —— 中途那一轮她已经吐的字（或者占位符）
+      必须被顶掉，不然「让我想想…」会和后半句拼在同一个气泡里。
+    """
+    print("智能体工具轮：")
+    chat_store.clear()
+    tool_body = TC.tool_sse(
+        # 形状照抄真接口：name/id 在第一块，arguments 后来一段段拼
+        {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                         "function": {"name": "remember", "arguments": ""}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": '{"fact":'}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": ' "用户爱熬夜"}'}}]},
+    )
+    TC.Handler.seen_all = []
+    TC.Handler.body_sequence = [tool_body, _text_body("好", "的喵，", "记下了")]
+
+    win = new_window({"api_key": "sk-test"})
+    win.input.setPlainText("记住我爱熬夜")
+    win.send()
+    pend = win.pending
+
+    # 两个收尾信号互斥的后果就在这儿：第一轮不发 done，所以 pending 只有在
+    # 第二轮真的答完之后才会归 None。中途卡住的话这里会一直等到超时。
+    ck("整轮结束了（两轮都跑完）", wait_until(lambda: win.pending is None), True)
+    TC.Handler.body_sequence = None
+
+    ck("工具真的执行了", memory.load(), ["用户爱熬夜"])
+    ck("气泡里是第二轮的正文", pend.text(), "好的喵，记下了")
+    ck("界面只有一个气泡在收尾", win.btn.text(), "发送")
+
+    reqs = [r.get("json") or {} for r in TC.Handler.seen_all]
+    ck("一共发了两次请求", len(reqs), 2)
+
+    first, second = reqs[0], reqs[1]
+    ck("第一轮带上了工具说明", bool(first.get("tools")), True)
+    ck("第一轮还不是 tool 结果", [m["role"] for m in first["messages"]][-1], "user")
+
+    roles = [m["role"] for m in second["messages"]]
+    ck("第二轮末尾是 tool 结果", roles[-1], "tool")
+    ck("第二轮末尾往前是 assistant 的调用", roles[-2], "assistant")
+
+    call = second["messages"][-2].get("tool_calls") or [{}]
+    ck("回填的调用带上了 id", call[0].get("id"), "call_1")
+    ck("回填的调用带上了名字",
+       (call[0].get("function") or {}).get("name"), "remember")
+    ck("回填的调用带上了完整参数",
+       (call[0].get("function") or {}).get("arguments"), '{"fact": "用户爱熬夜"}')
+    ck("tool 结果的 tool_call_id 对得上",
+       second["messages"][-1].get("tool_call_id"), "call_1")
+
+    # 协议脚手架是**本轮临时**的，不该被写进聊天记录 —— 下次开窗回填历史时
+    # 那些 tool_call_id 没有任何意义，读起来也莫名其妙。
+    ck("聊天记录里没有 tool 角色",
+       [m["role"] for m in chat_store.load()], ["user", "assistant"])
+    win.close()
+
+
+def case_agent_off() -> None:
+    """关掉智能体之后，请求里不该再出现 tools —— 那是这个开关唯一的作用。"""
+    print("关掉智能体的开关：")
+    chat_store.clear()
+    TC.Handler.seen_all = []
+    win = new_window({"api_key": "sk-test", "agent": False})
+    win.input.setPlainText("在吗")
+    win.send()
+    ck("回复照样收尾", wait_until(lambda: win.worker is None), True)
+    ck("请求里没有 tools",
+       "tools" in ((TC.Handler.seen_all[0].get("json") or {})), False)
+    ck("回复内容没受影响", win.history[-1]["content"], FULL)
     win.close()
 
 
@@ -463,10 +569,12 @@ def case_two_sends_same_window() -> None:
     # 这条必须紧接着 send() 同步查：此刻还一个 chunk 都没到，攒的增量只能是空的。
     # 上一轮的残字要是没清干净（_start_reply 漏了清零），这里立刻就是 FULL。
     ck("新一轮的增量从零开始攒", win.pending_text, "")
-    # 欢迎语 / 第一条 / 第一条的回复 / 第二条，共 4 条 —— 上一轮的气泡没被顶掉
+    # 欢迎语 / 第一条 / 第一条的回复 / 第二条，再加她那个还没吐字的占位气泡
+    # —— 上一轮的气泡没被顶掉。占位符是 CW.TYPING（「…」）：`_start_reply` 先把
+    # 气泡建出来，此刻首块还没到，所以它显示的是占位符而不是空串。
     ck("上一轮的气泡还在，第二条也出来了",
        [t for t in texts(win) if t.strip()],
-       ["和 taffy 打个招呼吧喵", "第一条", FULL, "第二条"])
+       ["和 taffy 打个招呼吧喵", "第一条", FULL, "第二条", CW.TYPING])
 
     ck("第二条流没结束就收到了首块", wait_until(lambda: bool(win.pending_text)), True)
     ck("第二条流式中气泡显示到首块", pend2.text(), win.pending_text)
@@ -1211,6 +1319,42 @@ def _shot() -> int:
     return 0 if ok else 1
 
 
+def case_day_separator() -> None:
+    """日期分隔线：跨天才插一条，同一天多少条都只插一条。
+
+    `texts()`/`rows()` 按 objectName 把分隔线排掉了（见那两个函数），所以这里
+    单独查它 —— 排掉不等于不测。
+    """
+    print("日期分隔线：")
+    from datetime import datetime, timedelta
+
+    # 纯函数先测：解析不出来必须给空串，不能抛 —— 为一条分隔线把窗口打不开不值得。
+    ck("今天", CW.day_label(datetime.now().isoformat(timespec="seconds")), "今天")
+    ck("昨天", CW.day_label(
+        (datetime.now() - timedelta(days=1)).isoformat(timespec="seconds")), "昨天")
+    ck("没有 ts 给空串", CW.day_label(""), "")
+    ck("ts 是垃圾也给空串", CW.day_label("不是时间"), "")
+
+    chat_store.clear()
+    today = datetime.now()
+    old = today - timedelta(days=3)
+    chat_store.save([
+        {"role": "user", "content": "三天前说的",
+         "ts": old.isoformat(timespec="seconds")},
+        {"role": "assistant", "content": "三天前回的",
+         "ts": old.isoformat(timespec="seconds")},
+        chat_store.make("user", "今天说的"),
+    ])
+    win = new_window({})
+    days = [w.text() for i in range(win.msgs.count())
+            if (w := win.msgs.itemAt(i).widget()) is not None
+            and w.objectName() == CW.DAY_OBJECT]
+    ck("两条三天前 + 一条今天，插两条分隔", len(days), 2)
+    ck("分隔按时间先后", days[0] != days[1], True)
+    ck("最后一条是今天", days[-1], "今天")
+    win.close()
+
+
 def main() -> int:
     # 环境变量优先于 config.json，真设了的话「没 Key」那条用例就不成立了
     os.environ.pop("DEEPSEEK_API_KEY", None)
@@ -1223,6 +1367,8 @@ def main() -> int:
     try:
         run_case(case_no_key)
         run_case(case_send_then_stream)
+        run_case(case_agent_tool_round)
+        run_case(case_agent_off)
         run_case(case_stop_mid_stream)
         run_case(case_close_mid_stream)
         run_case(case_reopen_backfills)
@@ -1243,6 +1389,7 @@ def main() -> int:
         run_case(case_restore_geometry)
         run_case(case_atomic_save)
         run_case(case_avatar_cached)
+        run_case(case_day_separator)
     finally:
         srv.shutdown()
         shutil.rmtree(tmp, ignore_errors=True)
