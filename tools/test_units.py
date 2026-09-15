@@ -290,6 +290,27 @@ def test_bounce() -> None:
         FAILS.append("曲线不连续")
         print("  FAIL 曲线有跳变，关键帧插值断了")
 
+    # 窗口画的不是 bounce_curve，是 PetAnimator.state()。这两份实现算的是同一件
+    # 事 —— 一个「离地比例」，一个「占角色高度的位移」，必须落在同一个数上。
+    #
+    # 这条测试是补的：state() 以前把离地比例**原样**当位移传出去（0~1，
+    # 该乘 -HOP 却没乘），于是每点她一次她就往下挪一整只角色的高度、掉出窗口。
+    # 而冒烟测试的边界检查走的是 bounce_curve，一直是绿的 —— 量错了地方，
+    # 所以这个 bug 一路发到了用户手上。
+    a = A.PetAnimator()
+    worst = 0.0
+    for i in range(0, 401, 5):
+        u = i / 400.0
+        a._bounce = u
+        _, _, got, _, _ = a.state()
+        worst = max(worst, abs(got - curve[i][2]))
+    ck("state() 的位移跟 bounce_curve 一致（误差 < 1e-9）", worst < 1e-9, True)
+    ck("位移量级就是 HOP", round(max(abs(d) for _, _, d in curve), 6),
+       round(A.HOP, 6))
+    ck("腾空是往上（负数）", min(d for _, _, d in curve) < 0, True)
+    print(f"  ok   位移范围 {min(d for _, _, d in curve):+.4f}.."
+          f"{max(d for _, _, d in curve):+.4f} 角色高（HOP={A.HOP}）")
+
 
 def test_dance() -> None:
     r"""跳舞：帧号怎么走、循环、收尾，以及跳舞期间**不吃**呼吸/弹跳/眨眼。
@@ -353,6 +374,67 @@ def test_dance() -> None:
     # 再点一次是从头跳，不是接着跳
     a.dance(4, fps=10.0, loops=1)
     ck("重跳回到第 0 帧", a.state()[-1], 0)
+
+
+def test_idle() -> None:
+    r"""她自己找事做：间隔、动作分布、朝向平滑。
+
+    `idle_delay` / `pick_idle_action` 是纯函数，所以这里不用真等 45 秒、
+    也不用起 QApplication。`gaze_pose` 要 tick 才动，但 `PetAnimator` 是
+    QObject 不是 QWidget，不用 QApplication。
+    """
+    print("自己找事做：")
+    ck("roll=0 取下限", A.idle_delay(0.0), A.IDLE_MIN_S)
+    ck("roll=1 取上限", A.idle_delay(1.0), A.IDLE_MAX_S)
+    ck("越界的 roll 夹住", A.idle_delay(5.0), A.IDLE_MAX_S)
+    ck("负数也夹住", A.idle_delay(-1.0), A.IDLE_MIN_S)
+    mid = A.idle_delay(0.5)
+    ck("中间值在区间内", A.IDLE_MIN_S < mid < A.IDLE_MAX_S, True)
+
+    # 间隔不能短到像骚扰。这个数是「没人理她」之后多久才动一次，
+    # 调到 10 秒就等于她一直在动，那这个桌宠没法用了。
+    ck("最短间隔不短于 30 秒", A.IDLE_MIN_S >= 30.0, True)
+
+    # 三个动作都要分得到，且权重顺序（说话最多、跳舞最少）得对上 ——
+    # 写反了的话她会一直跳舞，那是最抢戏、最容易被烦的一个。
+    seen = [A.pick_idle_action(i / 1000.0) for i in range(1000)]
+    ck("三个动作都抽得到", sorted(set(seen)),
+       sorted(n for n, _ in A.IDLE_ACTIONS))
+    ck("说话比蹦多", seen.count("say") > seen.count("hop"), True)
+    ck("蹦比跳舞多", seen.count("hop") > seen.count("dance"), True)
+    ck("边界 1.0 不炸", A.pick_idle_action(1.0) in dict(A.IDLE_ACTIONS), True)
+    ck("越界也不炸", A.pick_idle_action(-3.0) in dict(A.IDLE_ACTIONS), True)
+
+    # 朝向：慢慢转过去，不是瞬移。直接拿目标画的话鼠标一动她就跳一下。
+    a = A.PetAnimator()
+    ck("初始看向正前方", a.gaze_pose, (0.0, 0.0))
+    a.set_gaze(1.0)
+    ck("刚设完还没动", a.gaze_pose, (0.0, 0.0))
+    a._tick()
+    after1 = a.gaze_pose[0]
+    ck("一个 tick 之后转了但没转到底",
+       (after1 > 0.0, after1 < A.GAZE_MAX_DEG), (True, True))
+    for _ in range(200):
+        a._tick()
+    ck("最终转到底", round(a.gaze_pose[0], 3), round(A.GAZE_MAX_DEG, 3))
+    a.set_gaze(-1.0)
+    for _ in range(200):
+        a._tick()
+    ck("反向也能到底", round(a.gaze_pose[0], 3), round(-A.GAZE_MAX_DEG, 3))
+    a.set_gaze(99.0)
+    for _ in range(400):
+        a._tick()
+    ck("目标越界时夹在极限角度", round(abs(a.gaze_pose[0]), 3),
+       round(A.GAZE_MAX_DEG, 3))
+    print(f"  ok   转向幅度 {A.GAZE_MAX_DEG} 度 / 位移 {A.GAZE_MAX_SHIFT:.1%} 角色宽")
+
+    # 跳舞期间一律不转 —— 那些帧是按人物底部对齐画的，叠一个整体旋转
+    # 就是每帧脚底都在变，看着像在地上打转。
+    a.set_gaze(1.0)
+    a.dance(4, fps=10.0, loops=1)
+    for _ in range(3):
+        a._tick()
+    ck("跳舞时不转头", a.gaze_pose, (0.0, 0.0))
 
 
 def run_case(fn) -> None:
@@ -604,7 +686,7 @@ def _memory_cases(M) -> None:
 def main() -> int:
     for fn in (test_balance, test_apikey, test_persona_path, test_chat_store,
                test_chat_prompt, test_load_persona, test_chat_trim,
-               test_sse_parse, test_bounce, test_dance, test_voice,
+               test_sse_parse, test_bounce, test_dance, test_idle, test_voice,
                test_tool_calls, test_agent, test_memory):
         run_case(fn)
     print()

@@ -25,6 +25,7 @@ r"""让她**出声** —— 从预渲染的语音库里挑一条最贴的播出�
 `index.json` 缺失或读坏了都只是**没有语音**，不影响其他任何功能。
 """
 import json
+import random
 from pathlib import Path
 
 from . import paths
@@ -132,6 +133,21 @@ class Voice:
                     best, score = e, len(t)
         return best
 
+    def play_entry(self, entry: dict) -> bool:
+        r"""直接播某一条，不做关键词匹配。播了返回 True。
+
+        `play` 是「给我一句话，你自己找最贴的」，这个是「就这条」——
+        条目已经挑好了的地方（她自己找事做时抽到的那句）走这条，
+        否则还得让 `pick` 在同样的文本上再猜一次，猜不出就白抽了。
+        """
+        if not self.available or not entry:
+            return False
+        eff = self._effects.get(entry.get("file"))
+        if eff is None:
+            return False
+        eff.play()
+        return True
+
     def play(self, text: str, *fallbacks: str) -> bool:
         r"""播一条跟 `text` 最贴的。播了返回 True，一条都挑不出来返回 False。
 
@@ -143,10 +159,16 @@ class Voice:
             return False
         for t in (text, *fallbacks):
             e = self.pick(t)
-            if e is None:
-                continue
-            eff = self._effects.get(e["file"])
-            if eff is not None:
-                eff.play()
+            if e is not None and self.play_entry(e):
                 return True
         return False
+
+    def random_line(self):
+        r"""随便挑一条台词，挑不到返回 None。她自己找事做的时候用。
+
+        **不做匹配**：这是「她自己想说点什么」，不是「回应用户说了什么」，
+        所以随便哪条都成立，挑得越散越好 —— 老是同一句会立刻被听出来。
+        """
+        if not self.available:
+            return None
+        return random.choice(self.entries)

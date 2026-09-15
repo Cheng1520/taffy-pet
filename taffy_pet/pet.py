@@ -4,14 +4,16 @@
 否则想挪个位置就会触发一次说话。
 """
 import json
+import random
 
 from PyQt5.QtCore import Qt, QRectF, QTimer
-from PyQt5.QtGui import QPainter, QPixmap
+from PyQt5.QtGui import (QBrush, QColor, QCursor, QGradient, QPainter, QPixmap,
+                         QRadialGradient)
 from PyQt5.QtWidgets import QApplication, QInputDialog, QLineEdit, QMenu, QWidget
 
 from . import config as cfgmod
 from . import paths
-from .anim import PetAnimator
+from .anim import HOP, PetAnimator, idle_delay, pick_idle_action
 from .balance import BalanceFetcher
 from .paths import ASSETS
 from .toast import Toast
@@ -29,6 +31,24 @@ from .voice import GREETING, Voice
 MARGIN_RATIO = 0.065
 CLICK_SLOP = 6       # 位移小于这个像素数还算点击
 CLICK_MS = 500       # 按下超过这么久算长按，不算点击
+
+# 脚下那个影子。它不参与任何动画计算，存在的唯一理由是让人读出**她是站在
+# 桌面上、不是贴在桌面上** —— 素材本身都是悬空的，没有地面参考时她怎么看
+# 都像浮着。腾空时影子同时缩小和变淡，这是整幅画里唯一说明「离地多高」的线索。
+# 影子宽度是照着**量出来的站姿**定的：立绘取景框贴着内容裁（见 dance_extract.py），
+# 最底下 3% 那一带（就是靴底）占立绘宽度的 42%，往下 10% 那一带是 51%。
+# 影子比站姿宽一截才露得出边 —— 卡在 51% 附近的话，它整个藏在靴子后面，
+# 只在两腿之间透出一小块，读起来是「地上有块灰」而不是「她站在这儿」。
+SHADOW_W_RATIO = 0.80      # 影子宽度 / 角色显示宽度
+SHADOW_H_RATIO = 0.16      # 影子高度 / 影子宽度
+SHADOW_ALPHA = 0.30        # 落地时影子中心的不透明度
+SHADOW_LIFT_SHRINK = 0.35  # 跳到最高点时影子缩掉的比例
+SHADOW_LIFT_FADE = 0.45    # 跳到最高点时淡掉的比例
+
+# 鼠标离她多远算「完全朝那边看」，单位是**窗口宽度的倍数**。
+# 写死像素不行：窗口宽度跟着 config 的 height 走，把角色调大一点，
+# 「完全转向」的距离就该跟着变远，否则一大就再也不转了。
+GAZE_REACH = 3.0
 
 
 class PetWindow(QWidget):
@@ -78,8 +98,20 @@ class PetWindow(QWidget):
         self._moved = False
 
         self.animator = PetAnimator(bool(cfg.get("blink", False)))
+        # 先接朝向、再接 update：信号按**连接顺序**触发，反过来的话画这一帧用的
+        # 是上一帧算出来的朝向，她永远慢半拍。
+        self.animator.frame.connect(self._update_gaze)
         self.animator.frame.connect(self.update)
         self.animator.start()
+
+        self._shadow = self._make_shadow()
+
+        # 她自己找事做。存在的理由见 anim.IDLE_ACTIONS —— 简言之：没人会
+        # 对桌宠右键，所以跳舞得她自己演。
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.timeout.connect(self._idle_act)
+        self._restart_idle()
 
         self._sound = self._load_sound()
         # 语音库归 Pet 持有，聊天窗只管调用 —— 音量配置只有一份（cfg["volume"]），
@@ -174,8 +206,53 @@ class PetWindow(QWidget):
         return x, y
 
     # ---------- 绘制 ----------
+    def _make_shadow(self) -> QPixmap:
+        r"""烘一张脚下的软影子，只做一次。
+
+        做成椭圆的**径向渐变**（`ObjectBoundingMode` 会让渐变跟着外接矩形
+        拉伸，所以画的虽然是椭圆，等值线也是椭圆的，不会有硬边）。
+        烘成 pixmap 而不是每帧现画：形状永远一样，每帧变的只是缩放和透明度，
+        50fps 下每秒重建 50 次渐变是白花的。
+
+        颜色用纯黑。半透明黑在白色桌面和深色桌面上都读作「影子」，
+        而带一点色调的（比如偏紫）在白底上会像污渍。
+        """
+        w, h = 256, 64
+        pm = QPixmap(w, h)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        g = QRadialGradient(0.5, 0.5, 0.5)
+        g.setCoordinateMode(QGradient.ObjectBoundingMode)
+        g.setColorAt(0.0, QColor(0, 0, 0, 255))
+        g.setColorAt(0.45, QColor(0, 0, 0, 150))
+        g.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(g))
+        # 内缩 1px：抗锯齿的边缘正好落在边界上会被裁掉，看着像刀切的
+        p.drawEllipse(QRectF(1, 1, w - 2, h - 2))
+        p.end()
+        return pm
+
+    def _update_gaze(self) -> None:
+        r"""把「鼠标在她哪一侧」告诉动画器。
+
+        用**全局**坐标，不是窗口内坐标：鼠标移出她的窗口之后她还得继续看着
+        （那才是「她在看着你」），窗口内坐标一出界就没意义了。
+
+        只在动画节拍上算，不挂鼠标事件：鼠标在**别的窗口上**移动时这里一个
+        事件都收不到，挂事件的话她只在自己窗口里跟得上。
+        """
+        cx = self.x() + self.width() / 2.0
+        reach = max(1.0, self.width() * GAZE_REACH)
+        self.animator.set_gaze((QCursor.pos().x() - cx) / reach)
+
     def paintEvent(self, _event) -> None:
         sx, sy, dy, blinking, dance_i = self.animator.state()
+        # 是 property 不是方法 —— 写成 `gaze_pose()` 是 TypeError，而在 paintEvent
+        # 里抛异常不是弹个 traceback 就算了：Qt 会把进程直接打死（退出码 127），
+        # 从外面看跟崩溃一模一样。
+        lean_deg, shift = self.animator.gaze_pose
 
         if dance_i is None:
             src = self.pix_blink if blinking else self.pix
@@ -196,7 +273,26 @@ class PetWindow(QWidget):
         # 窗口一边，拖动时手感和落点对不上。
         dest_w = ar * self.disp_h
         left = m + (self.disp_w - dest_w) / 2.0
+
+        # 影子先画。它**不跟着倾斜**：影子是落在地面上的东西，跟着人一起歪
+        # 就变成贴在她身上的一块黑。横向跟着 shift 走一点，但幅度比人小一半，
+        # 那点差值就是「她在动、地面没动」。
+        lift = max(0.0, -dy / HOP) if HOP else 0.0
+        sw = dest_w * SHADOW_W_RATIO * (1.0 - SHADOW_LIFT_SHRINK * lift)
+        if sw >= 2.0:
+            sh = sw * SHADOW_H_RATIO
+            p.setOpacity(SHADOW_ALPHA * (1.0 - SHADOW_LIFT_FADE * lift))
+            # 必须给三个参数：Qt 没有 `drawPixmap(QRectF, QPixmap)` 这个重载
+            # （两参数那个只吃 QRect），少写一个源矩形是 TypeError。
+            p.drawPixmap(QRectF(w / 2.0 + shift * dest_w * 0.5 - sw / 2.0,
+                                h - m - sh, sw, sh),
+                         self._shadow, QRectF(self._shadow.rect()))
+            p.setOpacity(1.0)
+
         p.translate(w / 2.0, h - m)           # 锚点：底部中心
+        # 倾斜也绕这个锚点 —— 绕腰或绕中心的话脚会离开地面，看着像飘着转
+        p.rotate(lean_deg)
+        p.translate(shift * dest_w, 0.0)
         p.scale(sx, sy)
         p.translate(-w / 2.0, -(h - m) + dy * self.disp_h)
         p.drawPixmap(QRectF(left, m, dest_w, self.disp_h), src, src_rect)
@@ -210,6 +306,8 @@ class PetWindow(QWidget):
         self._press_t = QTimer()          # 只用来判断是不是长按
         self._press_t.start(CLICK_MS)
         self._moved = False
+        # 他一碰她，闲置计时就从头算 —— 「她自己找事做」的前提是**没人理她**。
+        self._restart_idle()
 
     def mouseMoveEvent(self, e) -> None:
         if self._press is None:
@@ -246,7 +344,8 @@ class PetWindow(QWidget):
         """透明窗口没有任何可见的边框，不提示的话没人知道能右键、能拖。"""
         if self.cfg.get("hint_shown"):
             return
-        self.toast.show_message("拖我可以换位置 · 右键点我打开菜单")
+        self.toast.show_message("拖我换位置 · 右键点我打开菜单",
+                                "没人理我的时候，我自己会动")
         self.toast.anchor_above(self.frameGeometry())
         self.cfg["hint_shown"] = True
         cfgmod.save(self.cfg)
@@ -304,6 +403,12 @@ class PetWindow(QWidget):
             say.setText("说话出声（没装语音库）")
         say.toggled.connect(self._set_voice)
 
+        idle = m.addAction("自己找事做")
+        idle.setCheckable(True)
+        idle.setChecked(bool(self.cfg.get("idle", True)))
+        idle.setToolTip("没人理她的时候，过一会儿她自己会跳舞、说话或者蹦一下")
+        idle.toggled.connect(self._set_idle)
+
         m.addSeparator()
         m.addAction("退出", self.quit)
         return m
@@ -320,10 +425,74 @@ class PetWindow(QWidget):
         self.animator.dance(int(self.dance_meta["frames"]),
                             float(self.dance_meta.get("fps", 15.0)))
 
+    # ---------- 她自己找事做 ----------
+    def _restart_idle(self) -> None:
+        r"""重新排一次「她自己找事做」。
+
+        每次都显式重排，不用 setInterval：间隔是随机的（`anim.idle_delay`），
+        固定周期会变成「每 45 秒她动一下」的节拍器，几天下来比不动还假。
+
+        用户在做什么就先不作数 —— 每次交互都调一遍这个，等于「他不动了我才动」。
+        """
+        if not self.cfg.get("idle", True):
+            self._idle_timer.stop()
+            return
+        self._idle_timer.start(int(idle_delay(random.random()) * 1000))
+
+    def _idle_act(self) -> None:
+        r"""闲置够久了：她自己挑一件事做，然后把定时器排回下一次。
+
+        **先排定时器、再做事**：`do_dance` 这一路要读素材，真抛了异常的话，
+        排在后面就把这个功能永久停掉了 —— 而且从桌面上完全看不出来，她只是
+        从此不再自己动。排在前面，最坏也只是这一轮没演成。
+        """
+        self._restart_idle()
+
+        # 手正按着她（在拖、在长按）就别演：他会觉得她在跟他的手打架。
+        if self._press is not None:
+            return
+        # 聊天窗开着说明他正在跟她说话，这时候她自己蹦一句是抢戏。
+        chat = getattr(self, "chat", None)
+        if chat is not None and chat.isVisible():
+            return
+
+        action = pick_idle_action(random.random())
+        if action == "dance" and self.pix_dance is None:
+            # 没装舞蹈素材时「跳舞」退化成蹦一下，而不是什么都不发生 ——
+            # 抽到跳舞的那一轮空转，在用户看来就是「说好的自己动呢」。
+            action = "hop"
+
+        if action == "dance":
+            self.do_dance()
+            return
+
+        # 「说话」和「蹦」都从弹一下开始 —— 只有气泡没有动作的话，静音用户看到的
+        # 是「凭空冒出个气泡」，一秒钟都撑不住。差别只在说不说那句话。
+        self.animator.pounce()
+        if action != "say":
+            return
+
+        entry = self.voice.random_line()
+        if entry is None:
+            return                       # 没装语音库：已经弹过了，这一轮就算了
+        self.voice.play_entry(entry)
+        # 她说了什么得看得见 —— 否则静音用户看到的是「她莫名其妙弹了一下」。
+        text = str(entry.get("text", "")).strip()
+        if text:
+            self.toast.show_message(text)
+            self.toast.anchor_above(self.frameGeometry())
+
     def _set_blink(self, on: bool) -> None:
         self.cfg["blink"] = bool(on)
         self.animator.set_blink_enabled(bool(on))
         cfgmod.save(self.cfg)
+
+    def _set_idle(self, on: bool) -> None:
+        self.cfg["idle"] = bool(on)
+        cfgmod.save(self.cfg)
+        # 关掉时先把已经排上的那一次取消（`_restart_idle` 里 stop 的就是它），
+        # 否则关掉之后最多还会再演一次，看着像开关没生效。
+        self._restart_idle()
 
     def _set_voice(self, on: bool) -> None:
         self.cfg["voice"] = bool(on)
@@ -347,6 +516,8 @@ class PetWindow(QWidget):
             from .chat_window import ChatWindow
             self.chat = ChatWindow(self.cfg, voice=self.voice)
         self.chat.show_and_raise()
+        # 开聊也算「有人理她」，闲置计时从头算。
+        self._restart_idle()
 
     def edit_persona(self) -> None:
         """先把窗开出来再编辑 —— 在记事本里改完切回来就能直接接着说。"""

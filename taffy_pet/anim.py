@@ -57,8 +57,28 @@ BLINK_MS = 130
 BLINK_MIN_S = 2.8
 BLINK_MAX_S = 6.0
 
+# 朝鼠标倾斜。她只有一张平面立绘，没有骨骼也没有分层，所以「转头看你」只能用
+# **整体绕脚底转一个很小的角度**来装作。幅度一大立刻露馅 —— 整张图在转，裙子
+# 和头发会跟着歪；3.2 度是「看得出她在动」和「看得出是假转」之间的那条线。
+#
+# 绕的是**脚底**（跟呼吸、弹跳同一个锚点）。绕腰或绕中心的话脚会离开地面，
+# 看着像飘在半空转。
+GAZE_MAX_DEG = 3.2
+GAZE_MAX_SHIFT = 0.012    # 朝鼠标那一侧平移的比例（占角色宽度），垫一点视差
+GAZE_TAU = 0.30           # 平滑时间常数（秒）。不平滑的话她像被一根线拽着走
+
 DANCE_LOOPS = 3          # 点一次「跳个舞」跳几遍
 DANCE_FPS = 15.0         # 兜底帧率。正常走 dance.json 里的那个
+
+# 闲置够久之后她自己挑一件事做。
+#
+# 这个功能存在的理由只有一个：**没人会对桌宠右键**。跳舞、说话这些动作
+# 藏在右键菜单里等于没有 —— 得她自己演出来，才有人看得见。
+IDLE_MIN_S = 45.0
+IDLE_MAX_S = 110.0
+# (动作, 权重)。权重大致按「打扰程度」的倒数给：说话最轻，蹦一下次之，
+# 跳舞最占地方、最抢戏，所以最少出现。
+IDLE_ACTIONS = (("say", 5), ("hop", 3), ("dance", 2))
 
 
 def _sample(u: float):
@@ -85,6 +105,30 @@ def bounce_curve(steps: int = 400):
     return out
 
 
+def idle_delay(roll: float) -> float:
+    """两次「她自己找事做」之间隔多久（秒）。`roll` 取 [0, 1)。
+
+    纯函数：测试直接喂数，不用真等 45 秒。
+    """
+    return IDLE_MIN_S + (IDLE_MAX_S - IDLE_MIN_S) * max(0.0, min(1.0, roll))
+
+
+def pick_idle_action(roll: float) -> str:
+    """闲置时她做什么，返回 IDLE_ACTIONS 里的动作名。`roll` 取 [0, 1)。
+
+    纯函数，理由同 `bounce_curve`：不然要验「三个动作都分得到」就得起
+    QApplication、还得等一个 45 秒的定时器。
+    """
+    acc = 0.0
+    total = float(sum(w for _, w in IDLE_ACTIONS))
+    for name, w in IDLE_ACTIONS:
+        acc += w / total
+        if roll < acc:
+            return name
+    # 浮点累加偶尔到不了 1.0，兜到最后一项而不是抛异常
+    return IDLE_ACTIONS[-1][0]
+
+
 class PetAnimator(QObject):
     """每帧发一次 frame，窗口收到就重绘。"""
 
@@ -96,6 +140,12 @@ class PetAnimator(QObject):
         self._t = 0.0
         self._bounce = 1.0        # 弹跳进度，1.0 = 已结束
         self._blinking = False
+
+        # 朝鼠标的方向，-1 = 她在屏幕最左边看着的鼠标、+1 = 最右边。
+        # 分「目标」和「当前」两个：目标每帧由窗口按鼠标位置算出来，当前值
+        # 在 _tick 里朝它追 —— 直接拿目标画的话，鼠标一动她就瞬移一下。
+        self._gaze_target = 0.0
+        self._gaze = 0.0
 
         # 跳舞状态。三个量分开存是因为它们的寿命不一样：
         # _dance_frames 是素材事实（取帧号要拿它取模），另外两个是这一次播放的进度。
@@ -156,6 +206,10 @@ class PetAnimator(QObject):
     # ---------- 每帧 ----------
     def _tick(self) -> None:
         self._t += FPS_MS / 1000.0
+        # 指数趋近（不是线性）：鼠标停下来时她也要跟着停下来，线性会匀着挪半天。
+        # 系数用 1-exp(-dt/tau) 而不是 dt/tau —— 后者在 dt 接近 tau 时会冲过头。
+        dt = FPS_MS / 1000.0
+        self._gaze += (self._gaze_target - self._gaze) * (1.0 - math.exp(-dt / GAZE_TAU))
         if self.dancing:
             self._dance_elapsed += FPS_MS / 1000.0
             if self._dance_played() >= self._dance_total:
@@ -166,6 +220,26 @@ class PetAnimator(QObject):
         elif self.bouncing:
             self._bounce = min(1.0, self._bounce + FPS_MS / BOUNCE_MS)
         self.frame.emit()
+
+    def set_gaze(self, target: float) -> None:
+        """告诉动画器鼠标在哪个方向：-1 = 她的左边，+1 = 她的右边。
+
+        超过这个范围也没关系（屏幕比她的活动范围大得多），夹住就行 ——
+        不夹的话鼠标贴到屏幕边缘时她会歪到看起来像要倒了。
+        """
+        self._gaze_target = max(-1.0, min(1.0, float(target)))
+
+    @property
+    def gaze_pose(self):
+        """返回 (绕脚底的倾斜角度, 横向位移比例)。
+
+        跳舞期间一律是 (0, 0)：那些帧是完整的动作，**按人物底部对齐**画好的，
+        再叠一个整体旋转就是每帧的脚底位置都在变，看着像在地上打转。
+        跟「跳舞为什么是覆盖而不是叠加」是同一条理由。
+        """
+        if self.dancing:
+            return 0.0, 0.0
+        return self._gaze * GAZE_MAX_DEG, self._gaze * GAZE_MAX_SHIFT
 
     def _dance_played(self) -> int:
         """已经放到第几帧 —— **不取模**，只用来判断跳完没有。
@@ -227,7 +301,19 @@ class PetAnimator(QObject):
         sy = sx = 1.0
         dy = 0.0
         if self.bouncing:
-            sy, sx, dy = _sample(self._bounce)
+            sy, sx, lift = _sample(self._bounce)
+            # **一定要转成 -lift*HOP**，跟 `bounce_curve` 用同一个换算。
+            #
+            # 这里原来直接把 `_sample` 的第三个值当 dy 传出去 —— 那是「离地比例」
+            # （0~1），不是一个占角色高度的位移量。调用方 pet.py 拿它去乘
+            # `disp_h`，于是每点她一次，她就**向下挪一整只角色的高度**：200px 的
+            # 角色整个掉出 226px 的窗口，只剩头顶露在底下，再慢慢滑回来。
+            #
+            # 之所以一直没被发现：冒烟测试的边界检查走的是 `bounce_curve()`
+            # （那个函数换算是**对的**），而窗口走的是 state()。两边算的是同一件
+            # 事、却是两份实现，测试量的跟屏幕上画的不是一条路。
+            # `test_bounce_state` 现在把两者钉在一起。
+            dy = -lift * HOP
         sy += BREATH_AMP * breath
         sx -= BREATH_AMP * BREATH_WIDE * breath
         return sx, sy, dy, self._blinking, None

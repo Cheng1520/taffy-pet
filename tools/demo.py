@@ -43,6 +43,7 @@ r"""录一段白底演示视频：`_work\demo\taffy-demo.mp4`。
 理由，不是可选的加固。
 """
 import argparse
+import math
 import os
 import shutil
 import subprocess
@@ -65,6 +66,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PyQt5.QtWidgets import QApplication
 
 from taffy_pet import agent
+from taffy_pet import anim as animmod
 from taffy_pet.chat_window import TYPING, ChatWindow
 from taffy_pet.pet import PetWindow
 from taffy_pet.paths import VOICE_DIR
@@ -96,16 +98,20 @@ DEMO_NOW = "现在是 2026 年 9 月 15 日 22:32（晚上，星期二）"
 # 每一段的首尾写在这儿，下面每个 scene 函数只管自己那一段内部的进度。
 T_TITLE = (0.0, 4.0)
 T_IDLE = (4.0, 7.0)
-T_TALK = (7.0, 13.0)
-T_DANCE = (13.0, 19.5)
-T_CHAT = (19.5, 37.5)
-T_OUT = (37.5, 41.0)
+T_ALONE = (7.0, 13.0)      # 没人理她，她自己动了
+T_TALK = (13.0, 19.0)
+T_DANCE = (19.0, 25.5)
+T_CHAT = (25.5, 43.5)
+T_OUT = (43.5, 47.0)
 TOTAL = T_OUT[1]
 
 # 她说的那句话之一。**刻意不写死时间**（「现在是 22 点」）：轨迹行里已经是
 # 真的时间了，回复里再写一个对不上就成了自己打自己的脸。
 TALK_SPEECH = "关注塔菲喵关注塔菲谢谢喵"
 TALK_BALANCE = "余额 ¥42.00"       # 演示用的假数字，不是任何人的真实余额
+# 她自己找事做时冒出来的那句。**取自语音库里的原句**（voice/14.wav），不是编的 ——
+# 演示里出现的话要么是真的，要么就别出现。
+ALONE_LINE = "塔菲在看着你哦。"
 
 DEMO_CFG = {
     # 没有 api_key。这一条是**故意的** —— 演示脚本不该有能力碰到用户的 Key
@@ -119,6 +125,7 @@ DEMO_CFG = {
     "volume": 1.0,
     "voice": True,
     "agent": True,
+    "idle": True,
     "pos": None,
     "chat_geometry": None,
 }
@@ -294,7 +301,8 @@ class Stage:
 
     # ---------- 她 ----------
     def pet_at(self, t: float, *, cx: int, blink: bool = False,
-               bounce: float = 1.0, dancing: bool = False) -> QPixmap:
+               bounce: float = 1.0, dancing: bool = False,
+               gaze: float = 0.0) -> QPixmap:
         r"""把她拨到 `t` 这一刻该有的样子，抓一张。
 
         手动拨的是 `PetAnimator` 的几个私有量，因为它的公开接口是**按真实时间
@@ -306,6 +314,11 @@ class Stage:
         - `bounce` 是弹跳进度 0.0~1.0，1.0 = 没在弹。
         - `dancing` 为真时前几项全被忽略（见 anim.py 里「跳舞为什么是覆盖」），
           这时 `t` 改成**跳舞已经放了多久**。
+        - `gaze` 是朝向 -1~+1。**必须显式给**：真机上它由鼠标位置算出来
+          （`PetWindow._update_gaze`），而渲染的时候鼠标在哪跟片子毫无关系 ——
+          不钉住的话，整支片子里她会一直歪在一个由录制者鼠标位置决定的角度上。
+          同时直接写 `_gaze`（不光是目标值）：那是个带平滑的状态量，只设目标
+          的话它要几帧才追上去，抓的是哪一帧就说不准了。
         """
         a = self.pet.animator
         if dancing:
@@ -321,6 +334,7 @@ class Stage:
             a._t = t
             a._bounce = bounce
             a._blinking = blink
+            a._gaze = a._gaze_target = max(-1.0, min(1.0, gaze))
         return _grab(self.pet)
 
     def dance_len(self) -> float:
@@ -511,6 +525,8 @@ def compose(st: Stage, scene: ChatScene, t: float) -> QImage:
         _scene_title(p, t)
     elif t < T_IDLE[1]:
         _scene_idle(st, p, t)
+    elif t < T_ALONE[1]:
+        _scene_alone(st, p, t)
     elif t < T_TALK[1]:
         _scene_talk(st, p, t)
     elif t < T_DANCE[1]:
@@ -555,9 +571,47 @@ def _scene_idle(st: Stage, p: QPainter, t: float) -> None:
     # 眨眼安排在这一段里固定的一次，位置是掐着秒表挑的：太靠前会被上一段的
     # 淡出吃掉，太靠后又来不及在切镜头前看见。
     blink = 1.6 <= local <= 1.75
-    pm = st.pet_at(t, cx=PET_CX_SOLO, blink=blink)
+    # 朝鼠标转头，在这里演一遍：先左后右再回正。真机上这个值是鼠标位置算出来的
+    # （`_update_gaze`），渲染时没有鼠标，所以手动扫一遍把它演出来 ——
+    # 不演的话这一段跟「她只是一张静图」没区别。
+    gaze = math.sin(local * 1.5)
+    pm = st.pet_at(t, cx=PET_CX_SOLO, blink=blink, gaze=gaze)
     _blit_pet(st, p, pm, PET_CX_SOLO)
-    draw_block(p, H - 62, [("左键点她一下：说话、报余额、蹦一下", 24, DIM, False)])
+    draw_block(p, H - 62,
+               [("她会跟着鼠标微微转头 · 脚下那片影子跟着弹跳一起缩", 24, DIM, False)])
+
+
+def _scene_alone(st: Stage, p: QPainter, t: float) -> None:
+    r"""没人理她，她自己动起来了。
+
+    这一段是「她自己找事做」的实拍，**不是在演一个举手势的动画**：她在真实运行里
+    被闲置计时器叫醒时，做的就是这两件事 —— 蹦一下 + 冒一句话。
+
+    那句话是语音库里的**原句**（14.wav），不是编的。她说的时候头顶浮出那句话，
+    是因为真机上就是这么做的：静音用户看不见声音，不写出来他只会看到
+    「她莫名其妙弹了一下」。
+    """
+    local = t - T_ALONE[0]
+    # 前 1.1 秒安静。她自己动之前本来就是安静的，一上来就动反而像被谁点了 ——
+    # 而这一段要说的恰恰是「没人点她」。
+    if local < 1.1:
+        pm = st.pet_at(t, cx=PET_CX_SOLO)
+    else:
+        # 弹跳走**真实时长**（anim.py 的 BOUNCE_MS），不写死 0.62。
+        # 改了关键帧曲线、片子跟着走，不用回来改这儿。
+        span = animmod.BOUNCE_MS / 1000.0
+        pm = st.pet_at(t, cx=PET_CX_SOLO,
+                       bounce=min(1.0, (local - 1.1) / span))
+    x, y = _blit_pet(st, p, pm, PET_CX_SOLO)
+
+    if local >= 1.3:
+        st.toast_on(ALONE_LINE, "")
+        tx, ty = st.toast_pos(pm, x, y)
+        p.drawPixmap(tx, ty, _grab(st.toast))
+    else:
+        st.toast_off()
+    draw_block(p, H - 62,
+               [("没人理她的时候，她自己会说话、蹦一下，或者跳个舞", 24, DIM, False)])
 
 
 def _scene_talk(st: Stage, p: QPainter, t: float) -> None:
@@ -593,7 +647,8 @@ def _scene_dance(st: Stage, p: QPainter, t: float) -> None:
     else:
         pm = st.pet_at(t, cx=PET_CX_SOLO)
     _blit_pet(st, p, pm, PET_CX_SOLO)
-    draw_block(p, H - 62, [("右键 →「跳个舞」", 24, DIM, False)])
+    draw_block(p, H - 62,
+               [("她自己会跳 · 想立刻看就右键 →「跳个舞」", 24, DIM, False)])
 
 
 def _scene_chat(st: Stage, scene: ChatScene, p: QPainter, t: float) -> None:
@@ -665,6 +720,7 @@ def main() -> int:
     # 音效落在哪一秒。跟她动作对齐：点她之后 0.35 秒出声（跟气泡同时），
     # 跳舞那段配一句，聊天里两条轨迹各配一句。
     clips = [
+        (T_ALONE[0] + 1.3, "14.wav", 0.85),        # 「塔菲在看着你哦。」—— 她自己说的
         (T_TALK[0] + 0.35, "01.wav", 0.85),        # 「在呢在呢，怎么啦喵。」
         (T_DANCE[0] + 0.9, "03.wav", 0.85),        # 「雏草姬今天也要开心哦。」
         (T_CHAT[0] + 10.6, "18.wav", 0.85),        # 「塔菲记得的。」—— 记事那条之后
