@@ -35,6 +35,13 @@ from . import paths
 # 对不上的话，听感上是「这货在乱说」。宁可少播。
 MIN_TRIGGER = 2
 
+# 点击她时的兜底招呼，见 `Voice.play` 的文档。
+#
+# `speech`（默认「关注塔菲喵关注塔菲谢谢喵」）是用户自己配的文案，跟语音库的
+# 触发词没有任何约定关系，对不上才是常态。所以点击时拿它当**首选**，
+# 挑不出来再退到这句。「在呢」是 01.wav 的触发词之一，正常情况下必然挑得出。
+GREETING = "在呢在呢"
+
 
 def read_index(d) -> list:
     r"""读 `d/index.json`，返回能用的条目。
@@ -125,15 +132,21 @@ class Voice:
                     best, score = e, len(t)
         return best
 
-    def play(self, text: str) -> bool:
-        r"""播一条跟 `text` 最贴的。播了返回 True。"""
+    def play(self, text: str, *fallbacks: str) -> bool:
+        r"""播一条跟 `text` 最贴的。播了返回 True，一条都挑不出来返回 False。
+
+        `fallbacks` 依次兜底，理由在 `GREETING` 那儿：点击那一下的文案跟语音库
+        没有任何约定关系，只走一次 `pick` 的话，用户点她永远没声 —— 而点她出声
+        是他判断「这玩意儿到底有没有语音」的唯一途径。
+        """
         if not self.available:
             return False
-        e = self.pick(text)
-        if e is None:
-            return False
-        eff = self._effects.get(e["file"])
-        if eff is None:
-            return False
-        eff.play()
-        return True
+        for t in (text, *fallbacks):
+            e = self.pick(t)
+            if e is None:
+                continue
+            eff = self._effects.get(e["file"])
+            if eff is not None:
+                eff.play()
+                return True
+        return False

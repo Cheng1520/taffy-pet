@@ -15,7 +15,7 @@ from .anim import PetAnimator
 from .balance import BalanceFetcher
 from .paths import ASSETS
 from .toast import Toast
-from .voice import Voice
+from .voice import GREETING, Voice
 
 # 边距是角色显示高度的比例，不是固定像素 —— 角色的放大/弹跳都是按比例缩放的，
 # 固定边距在角色调小之后会显得过大、调大之后又不够。
@@ -254,6 +254,10 @@ class PetWindow(QWidget):
     def on_click(self) -> None:
         self.play_sound()
         self.animator.pounce()
+        # 点她 = 打招呼。`speech` 是用户自己配的文案，跟语音库的触发词没有约定关系，
+        # 所以它只是首选，挑不出来退到 GREETING —— 到此为止的话，用户点她永远没声，
+        # 而「点她」是他判断这桌宠到底有没有语音的唯一途径。
+        self.voice.play(self.cfg.get("speech", ""), GREETING)
         self.toast.show_message(self.cfg.get("speech", ""), "余额查询中…")
         self.toast.anchor_above(self.frameGeometry())
         self.refresh_balance()

@@ -380,7 +380,7 @@ def test_voice() -> None:
     import tempfile
 
     from taffy_pet import config as C
-    from taffy_pet.voice import read_index, MIN_TRIGGER
+    from taffy_pet.voice import GREETING, read_index, MIN_TRIGGER
 
     print("语音库：")
     # load() 拿 DEFAULTS 当白名单：不在这儿的话，「关掉语音」存得进文件却在
@@ -418,6 +418,35 @@ def test_voice() -> None:
             {"file": "b.wav", "triggers": ["睡觉吧现在"]},
         ]
         ck("最长触发词胜出", v.pick("你睡觉吧现在")["file"], "b.wav")
+
+        # 点击时那条兜底。用户的 `speech` 跟触发词没有任何约定关系（默认的
+        # 「关注塔菲喵关注塔菲谢谢喵」一条都撞不上），只走一次 pick 的话点她
+        # 永远不出声 —— 而点她出声是他判断「有没有语音」的唯一途径。
+        class FakeEff:
+            def __init__(self):
+                self.played = 0
+
+            def play(self):
+                self.played += 1
+
+        v.cfg = {"voice": True}
+        v.entries = [{"file": "a.wav", "triggers": ["熬夜"]},
+                     {"file": "g.wav", "triggers": ["在呢"]}]
+        v._effects = {"a.wav": FakeEff(), "g.wav": FakeEff()}
+
+        ck("点击文案挑不出时退到兜底",
+           v.play("关注塔菲喵关注塔菲谢谢喵", GREETING), True)
+        ck("兜底播的是「在呢」那条", v._effects["g.wav"].played, 1)
+        ck("首选挑不出时不误播另一条", v._effects["a.wav"].played, 0)
+        ck("首选挑得出时不放兜底那条",
+           (v.play("今天熬夜了", GREETING), v._effects["a.wav"].played)[1], 1)
+        ck("全挑不出来返回 False 且一条都不播",
+           v.play("今天天气不错", "这句也挑不出来"), False)
+        ck("真的一条都没播", [e.played for e in v._effects.values()], [1, 1])
+
+        # 关掉语音时连兜底也不许响
+        v.cfg = {"voice": False}
+        ck("语音关掉后 play 直接返回 False", v.play("熬夜", GREETING), False)
 
     with tempfile.TemporaryDirectory() as td:
         (Path(td) / "index.json").write_text("{ 坏掉的 json", encoding="utf-8")
