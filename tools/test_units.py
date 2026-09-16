@@ -312,6 +312,94 @@ def test_bounce() -> None:
           f"{max(d for _, _, d in curve):+.4f} 角色高（HOP={A.HOP}）")
 
 
+def test_transform() -> None:
+    r"""变身：四拍接缝上不许跳变，光点不许飞出窗口。
+
+    这个测试是**补的**，代价是先写错了两遍：
+
+    1. 第一版 `pop` 蓄力收到 -0.02、爆发从 +0.05 起步，接缝处 7% 的瞬间跳变
+       —— 50fps 上是她一条腿突然弹一下；
+    2. 第一版光点每个阶段各写一套公式，蓄力收到 1.0 倍半径、爆发却从 0.6 倍
+       起步，接缝上每颗光点一帧之内横跳 0.16 个角色宽度（约 36px）。
+
+    两次都是**单看每个阶段都平滑**，只有把边界两边各取一个值比一比才看得见。
+    所以这里就把「边界两边各取一个值」直接写成断言。
+    """
+    print("变身：")
+    # 四个接缝：蓄力->爆发、爆发->维持、维持->消退、消退->结束
+    seams = (A.TF_CHARGE_MS,
+             A.TF_CHARGE_MS + A.TF_BURST_MS,
+             A.TF_CHARGE_MS + A.TF_BURST_MS + A.TF_HOLD_MS,
+             A.TF_MS)
+    eps = 1.0                      # 毫秒，够小到只跨过一个接缝
+    worst, where, bad = 0.0, "", []
+    for s in seams:
+        a, b = A.transform_visual(s - eps), A.transform_visual(s + eps)
+        for k in ("glow", "tint", "hops", "pop"):
+            d = abs(a[k] - b[k])
+            if d > worst:
+                worst, where = d, f"{k}@{s:.0f}ms"
+            if d > 0.02:
+                bad.append(f"{k}@{s:.0f}ms 跳 {d:.4f}")
+        # 环：两边都看得见才比。看不见的一侧（alpha=0 或者压根没有）不算跳变。
+        if a["ring"] and b["ring"]:
+            d = abs(a["ring"][0] - b["ring"][0])
+            if d > worst:
+                worst, where = d, f"ring@{s:.0f}ms"
+            if d > 0.05:
+                bad.append(f"环半径@{s:.0f}ms 跳 {d:.4f}")
+        # 最后一个接缝的另一侧是 "done"，那一拍本来就没有光点（列表是空的），
+        # 不是「光点集体瞬移走了」—— 长度对不上就跳过。
+        if len(a["sparks"]) != len(b["sparks"]):
+            continue
+        for i, (x, y, _r, al) in enumerate(a["sparks"]):
+            bx, by, _br, bal = b["sparks"][i]
+            d = max(abs(x - bx), abs(y - by), abs(al - bal))
+            if d > worst:
+                worst, where = d, f"光点{i}@{s:.0f}ms"
+            if d > 0.05:
+                bad.append(f"光点{i}@{s:.0f}ms 跳 {d:.4f}")
+    print(f"  ok   四个接缝最大跳变 {worst:.4f}（{where}）")
+    ck("接缝上不跳变", bad or True, True)
+    if bad:
+        FAILS.append("变身接缝跳变")
+        for b in bad[:6]:
+            print("  FAIL " + b)
+
+    # 逐帧扫一遍：接缝之外的**任意一帧**也不该跳。上面只查边界，
+    # 这个查全程 —— 插值写错（比如漏了个关键帧）只有这里看得见。
+    step, ms, worst = A.FPS_MS, 0.0, 0.0
+    prev = None
+    while ms <= A.TF_MS + step:
+        cur = A.transform_visual(ms)
+        if prev:
+            for i, (x, y, _r, al) in enumerate(cur["sparks"]):
+                px, py, _pr, pal = prev["sparks"][i]
+                worst = max(worst, abs(x - px), abs(y - py), abs(al - pal))
+        prev, ms = cur, ms + step
+    print(f"  ok   光点相邻帧最大跳变 {worst:.4f}（一帧 {step:.0f}ms）")
+    # 阈值 0.08 是留了余量的：蓄力那 700ms 里亮度从 0 拉到 0.85，本来就贡献
+    # 0.036/帧（那是**刻意的淡入**，一路涨了很多帧，不是单帧跳变）。要抓的
+    # 是 0.16 那一档的瞬移 —— 阈值卡在 0.05 的话，谁把淡入调快一点就误报。
+    if worst > 0.08:
+        FAILS.append("光点逐帧跳变")
+        print("  FAIL 光点有单帧跳变，插值断了")
+
+    # 光点必须待在窗口里。窗口横向只有 disp_w/2 + margin（6.5% 角色高），
+    # 按本素材 0.57 的宽高比折合 ±0.61 个角色宽度。第一版轨道写到 ±1.3，
+    # **全在窗口外面被裁掉，渲染出来一颗都不剩，而代码上它们一直都在**。
+    mx = my = 0.0
+    ms = 0.0
+    while ms <= A.TF_MS:
+        for x, y, _r, al in A.transform_visual(ms)["sparks"]:
+            if al > 0.05:                      # 看不见的不算
+                mx, my = max(mx, abs(x)), max(my, abs(y))
+        ms += A.FPS_MS
+    print(f"  ok   可见光点范围 x ±{mx:.3f} / y -{my:.3f} 角色宽高（窗口约 ±0.61 / -1.065）")
+    ck("光点横向没出窗口", mx <= 0.61, True)
+    ck("光点纵向没出窗口", my <= 1.064, True)
+
+
 def test_dance() -> None:
     r"""跳舞：帧号怎么走、循环、收尾，以及跳舞期间**不吃**呼吸/弹跳/眨眼。
 
@@ -686,7 +774,8 @@ def _memory_cases(M) -> None:
 def main() -> int:
     for fn in (test_balance, test_apikey, test_persona_path, test_chat_store,
                test_chat_prompt, test_load_persona, test_chat_trim,
-               test_sse_parse, test_bounce, test_dance, test_idle, test_voice,
+               test_sse_parse, test_bounce, test_transform, test_dance, test_idle,
+               test_voice,
                test_tool_calls, test_agent, test_memory):
         run_case(fn)
     print()

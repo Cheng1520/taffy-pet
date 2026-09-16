@@ -77,8 +77,36 @@ DANCE_FPS = 15.0         # 兜底帧率。正常走 dance.json 里的那个
 IDLE_MIN_S = 45.0
 IDLE_MAX_S = 110.0
 # (动作, 权重)。权重大致按「打扰程度」的倒数给：说话最轻，蹦一下次之，
-# 跳舞最占地方、最抢戏，所以最少出现。
-IDLE_ACTIONS = (("say", 5), ("hop", 3), ("dance", 2))
+# 跳舞最占地方、最抢戏，所以最少出现。变身比跳舞还亮眼（整个角色的颜色
+# 都会变），所以权重压到最低 —— 它是「偶尔撞见一次」的东西，不是日常。
+IDLE_ACTIONS = (("say", 5), ("hop", 3), ("dance", 2), ("transform", 1))
+
+# ---------- 变身 ----------
+#
+# 四拍：蓄力 -> 爆发 -> 维持 -> 消退。**没有额外素材** —— 光晕、冲击环、
+# 光点、配色全都是画上去的，跟呼吸、影子同一条路子。
+#
+# 为什么要有「维持」这一拍、而且还这么长（5 秒）：光只有一下爆闪的话，
+# 那叫「闪了一下」不叫「变身」。变身这个动作**靠状态持续**来和闪光区分开：
+# 她得在光里待一会儿、身上得一直亮着、颜色得一直不一样，才读得出「她变了」。
+TF_CHARGE_MS = 700      # 蓄力：光收拢、她微微下沉
+TF_BURST_MS = 520       # 爆发：冲击环扫出去、白光最亮
+TF_HOLD_MS = 5200       # 维持：光晕常亮、光点绕着飞、整个人泛色
+TF_FADE_MS = 900        # 消退：亮度和颜色收回去
+TF_MS = TF_CHARGE_MS + TF_BURST_MS + TF_HOLD_MS + TF_FADE_MS
+
+TF_PARTICLES = 14       # 光点个数
+# 变身期间她离地的高度（占角色高度的比例）。变身是「浮起来」的，脚离地
+# 是这套视觉里最省事也最有效的一笔。上限受 MARGIN_RATIO 约束（见 pet.py）：
+# 那个边距是照着「呼吸 + 弹跳拉伸 + 腾空」算的 6.5%，变身不走弹跳那条路，
+# 所以这里只要不把余量吃光就行 —— 0.8% 加上呼吸的 0.8% 还不到 2%。
+TF_HOVER = 0.008
+TF_POP = 0.05           # 爆发瞬间她放大多少（比例）。同样受边距约束
+# 身上那层暖金的最大不透明度。**只能这么低** —— 染色是拿金色盖掉原色，
+# 越高她越像一块平的金色色斑（0.50 时五官和衣服就全糊了）。真正让「发光」
+# 立起来的是轮廓光，这层只负责把她整体烘暖一点。
+TF_TINT = 0.26
+
 
 
 def _sample(u: float):
@@ -129,6 +157,187 @@ def pick_idle_action(roll: float) -> str:
     return IDLE_ACTIONS[-1][0]
 
 
+def _smooth(t: float) -> float:
+    """smoothstep。关键帧和阶段之间都靠它过渡，线性会有折角。"""
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _bump(u: float, peak: float = 0.22) -> float:
+    """0 -> 1 -> 0 的鼓包，峰在 `peak`。两端都恰好是 0。
+
+    阶段之间的量**必须首尾接得上**。第一版 `pop` 是「蓄力慢慢沉到 -0.02、
+    爆发从 +0.05 开始」，两个阶段各自看都平滑，接缝处却是一个 7% 的瞬间跳变
+    —— 在 50fps 上就是她有一条腿突然弹了一下。这类接缝自己看不出来，得把
+    每个量在阶段边界上前后取一对值比一下才看得见（`test_transform` 现在会查）。
+    """
+    if u <= peak:
+        return _smooth(u / peak) if peak > 0 else 1.0
+    return 1.0 - _smooth((u - peak) / (1.0 - peak))
+
+
+def _wave(u: float) -> float:
+    """0 -> 1 -> 0 的余弦波，两端恰好是 0 且一阶导也是 0（接缝处不会有折角）。"""
+    return (1.0 - math.cos(u * 2.0 * math.pi)) / 2.0
+
+
+def transform_phase(ms: float):
+    """把「变身演了多久」映射成 (阶段名, 阶段内进度 0~1)。
+
+    纯函数，理由跟 `bounce_curve` 一样：不然验一次变身就得真等 7 秒。
+    """
+    ms = max(0.0, float(ms))
+    if ms < TF_CHARGE_MS:
+        return "charge", ms / TF_CHARGE_MS
+    ms -= TF_CHARGE_MS
+    if ms < TF_BURST_MS:
+        return "burst", ms / TF_BURST_MS
+    ms -= TF_BURST_MS
+    if ms < TF_HOLD_MS:
+        return "hold", ms / TF_HOLD_MS
+    ms -= TF_HOLD_MS
+    if ms < TF_FADE_MS:
+        return "fade", ms / TF_FADE_MS
+    return "done", 1.0
+
+
+def particle_seed(i: int) -> float:
+    """第 i 颗光点的固定相位，[0, 1)。
+
+    用整数散列而不是 `random`：演示视频是**按帧重渲染**的，同一秒必须每次
+    都长一样。用 random 的话每出一版片子光点位置都不一样，出了问题也没法
+    对着两版比。跟 `bounce_curve` 可重放是同一个要求。
+    """
+    return ((i * 2654435761) % 4096) / 4096.0
+
+
+# 整段变身的进度断点：0=蓄力起、1=爆发起、2=维持起、3=消退起、4=结束。
+# 下标 0..4 分别对应 _sparks 里各关键帧表的第几项。
+_T0 = 0.0
+_T1 = TF_CHARGE_MS / TF_MS
+_T2 = (TF_CHARGE_MS + TF_BURST_MS) / TF_MS
+_T3 = (TF_CHARGE_MS + TF_BURST_MS + TF_HOLD_MS) / TF_MS
+_T4 = 1.0
+
+# 光点轨道的三条关键帧曲线，都是「整段进度 t -> 值」。
+# **每一项的首尾由相邻关键帧共用**，连续性是结构上给的，不是每段各推公式凑的。
+TF_SPARK_R = ((_T0, 0.50), (_T1, 0.24), (_T2, 0.50), (_T3, 0.42), (_T4, 0.30))
+TF_SPARK_C = ((_T0, -0.44), (_T1, -0.42), (_T2, -0.52), (_T3, -0.78), (_T4, -0.95))
+TF_SPARK_A = ((_T0, 0.0), (_T1, 0.85), (_T2, 0.85), (_T3, 0.85), (_T4, 0.0))
+
+
+def _keys(tbl, t: float) -> float:
+    """在关键帧表上取值，段内用 `_smooth` 缓动。
+
+    `_smooth` 两端的导数都是 0，所以**每个内部关键帧左右导数都是 0**，
+    接出来是 C1 连续的 —— 光点飞过关键帧时不会有折角。
+    """
+    if t <= tbl[0][0]:
+        return tbl[0][1]
+    for (t0, v0), (t1, v1) in zip(tbl, tbl[1:]):
+        if t <= t1:
+            k = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+            return v0 + (v1 - v0) * _smooth(k)
+    return tbl[-1][1]
+
+
+def tf_progress(phase: str, u: float) -> float:
+    """阶段名 + 阶段内进度 -> 整段变身的进度 t（0..1）。"""
+    base = {"charge": _T0, "burst": _T1, "hold": _T2, "fade": _T3}.get(phase, _T4)
+    span = {"charge": _T1 - _T0, "burst": _T2 - _T1,
+            "hold": _T3 - _T2, "fade": _T4 - _T3}.get(phase, 0.0)
+    return min(1.0, base + u * span)
+
+
+def _sparks(phase: str, u: float):
+    """光点位置。坐标单位是**角色宽/高**，原点在她脚底中心，y 为负是在脚底以上。
+
+    四拍走位：蓄力时从外面收进来（「光在聚拢」）、爆发时炸出去、维持时绕着
+    她慢慢转、消退时飘散。收拢那一拍是必要的 —— 只有炸出去的话，它读起来是
+    「她炸了」而不是「她在变身」。
+
+    **整条轨道只写成「整段进度 t」的函数**，而不是每个阶段各写一套公式。
+    各写一套的话，接缝处要对齐的量有五个（x、y、轨道半径、中心高度、透明度），
+    漏掉任何一个都是**一帧之内光点整体瞬移**：第一版蓄力收到 1.0 倍半径、
+    爆发却从 0.6 倍起步，接缝上一帧之内每颗光点横跳 0.16 个角色宽度（约 36px），
+    50fps 下看得清清楚楚。单看每个阶段的代码都平滑，只有把边界两边各取一个值
+    比一比才看得出来 —— 改成一条曲线之后，这类错在结构上就发生不了了。
+    """
+    t = tf_progress(phase, u)
+    out = []
+    for i in range(TF_PARTICLES):
+        ang = particle_seed(i) * 2 * math.pi
+        # 半径、大小、亮度都错开：不错开的话它们会在同一圈上排队站好，
+        # 看着像一串珠子而不是一群光点。
+        spread = 0.85 + 0.30 * ((i * 7919) % 100) / 100.0
+        # **轨道半径封顶**：最外一圈 = 0.50 * 1.15 = 0.575 个角色宽度。
+        # 窗口横向只有 disp_w/2 + 边距，按本素材的比例算约合 ±0.61 个 dest_w。
+        # 第一版轨道写到 ±1.3，光点全在窗口外面被裁掉 —— 代码里一颗不少，
+        # 渲染出来一颗看不见，而且不报任何错。
+        r = _keys(TF_SPARK_R, t) * spread
+        cy = _keys(TF_SPARK_C, t)
+        # 转圈和「整段进度」走，不在阶段内归零 —— 归零的话每个接缝上角度都会
+        # 倒回去一次，光点会原地打个哆嗦
+        th = ang + t * 2.0 * math.pi * 1.15
+        x = math.cos(th) * r
+        y = cy + math.sin(th) * r * 0.42
+        a = _keys(TF_SPARK_A, t) * (0.75 + 0.25 * ((i * 104729) % 100) / 100.0)
+        # 直径 6~15px（按 dest_w 算）才看得见。第一版 0.012~0.025 是 1~2px，
+        # 又被那张径向渐变自身的外圈淡出吃掉一半，等于没画。
+        out.append((x, y, 0.030 + 0.045 * ((i * 31) % 7) / 7.0, max(0.0, a)))
+    return out
+
+
+def transform_visual(ms: float) -> dict:
+    """变身到 `ms` 毫秒时的全部画法参数。纯函数，不碰 QObject。
+
+    `ring` 是冲击环 `(半径倍数, 不透明度)`，半径单位是**角色宽度**；只有爆发
+    那一拍有，其余是 None。
+
+    `pop` 是额外放大比例。它跟 `TF_HOVER` 一起受 pet.py 的 `MARGIN_RATIO`
+    约束 —— 那 6.5% 是按「呼吸 + 弹跳拉伸 + 腾空」算的，这里两个量加起来
+    必须留在余量里，否则她窜起来那几帧呆毛会被窗口顶边裁掉（这个项目已经
+    在弹跳上栽过一次，见 pet.py 的 MARGIN_RATIO 注释）。
+    """
+    phase, u = transform_phase(ms)
+    v = {"phase": phase, "glow": 0.0, "ring": None, "tint": 0.0,
+         "hops": 0.0, "pop": 0.0, "sparks": []}
+    if phase == "done":
+        return v
+
+    if phase == "charge":
+        # 蓄力：光聚拢、她微微下沉。下沉用 sin 而不是 smoothstep —— 收尾要回到 0，
+        # 不然后面爆发那一拍开头接不上（见 _bump 的注释）。
+        v["glow"] = 0.55 * _smooth(u)
+        v["pop"] = -0.02 * math.sin(math.pi * u)
+    elif phase == "burst":
+        # 爆发：白光最亮、环扫出去、她放大一下。环在前段就扫完，别等这一拍走完
+        v["glow"] = 0.55 + 0.45 * _bump(u)
+        # 环**从她身上长出来**：半径起点几乎为 0、透明度从 0 快速拉上来。
+        # 第一版是「半径 0.35、透明度 0.9」凭空出现 —— 蓄力那一拍还没有环，
+        # 下一帧就多出一个 0.9 不透明度的圈，读起来是「画面里多了个东西」。
+        # 前 12% 拉满就够了：够快，仍然像「炸出来」而不是「淡进来」。
+        v["ring"] = (0.06 + 1.34 * _smooth(u),
+                     0.95 * _smooth(min(1.0, u / 0.12)) * (1.0 - u) ** 1.5)
+        # 染色快速拉满再回落一档 —— 这一下「变」要快，慢了就不像变身像渐变色
+        v["tint"] = TF_TINT * _smooth(min(1.0, u / 0.12)) * (1.0 - 0.25 * _smooth(u))
+        v["pop"] = TF_POP * _bump(u)
+        v["hops"] = TF_HOVER * _smooth(u)
+    elif phase == "hold":
+        # 亮着一会儿再动：变身靠「状态持续」区别于「闪了一下」。
+        # 三个量都在「首尾 = 爆发结束值」的基础上起伏，接缝才接得上。
+        v["glow"] = 0.55 + 0.17 * _wave(u)
+        v["tint"] = TF_TINT * (0.75 + 0.25 * _wave(u))
+        v["hops"] = TF_HOVER * (1.0 + 0.5 * math.sin(math.pi * u))
+    else:                                     # fade
+        k = 1.0 - _smooth(u)
+        v["glow"] = 0.55 * k
+        v["tint"] = TF_TINT * 0.75 * k
+        v["hops"] = TF_HOVER * k
+    v["sparks"] = _sparks(phase, u)
+    return v
+
+
 class PetAnimator(QObject):
     """每帧发一次 frame，窗口收到就重绘。"""
 
@@ -154,6 +363,10 @@ class PetAnimator(QObject):
         self._dance_elapsed = 0.0
         self._dance_fps = DANCE_FPS
 
+        # 变身进度（毫秒）。None = 没在变身。跟跳舞一样用「已经演了多久」
+        # 现算而不是每帧累加，理由见 frame_index()。
+        self._tf = None
+
         self._timer = QTimer(self)
         self._timer.setInterval(FPS_MS)
         self._timer.timeout.connect(self._tick)
@@ -173,7 +386,10 @@ class PetAnimator(QObject):
         # 跳舞的时候不接弹跳。画面上的理由是两套动作会打架，真正的原因是
         # 弹跳进度会**卡在 0**：_tick 里那一支在跳舞期间根本不走，等舞跳完
         # 才轮到它，于是她会在收尾那一瞬间莫名其妙补跳一下。
-        if self.dancing:
+        #
+        # 变身期间同理，而且更硬：那时候她的纵向位移已经被变身接管（悬浮 +
+        # 爆发那一下的放大），再叠一层弹跳就是两种位移相加，呆毛会顶出边距。
+        if self.dancing or self.transforming:
             return
         self._bounce = 0.0
 
@@ -184,6 +400,22 @@ class PetAnimator(QObject):
     @property
     def dancing(self) -> bool:
         return self._dance_frames > 0
+
+    @property
+    def transforming(self) -> bool:
+        return self._tf is not None
+
+    def transform(self) -> None:
+        """开始变身。再点一次就重头演，跟 `dance()` 同一个约定。
+
+        跳舞期间直接忽略：那些帧是完整动作、按人物底部对齐画的，上面再浮一层
+        光环和染色，等于给一段跳着的舞贴了张会动的贴纸。
+        """
+        if self.dancing:
+            return
+        self._tf = 0.0
+        self._bounce = 1.0        # 变身接管位移，别让弹跳半路插进来
+        self.frame.emit()
 
     def dance(self, frames: int, fps: float = DANCE_FPS,
               loops: int = DANCE_LOOPS) -> None:
@@ -217,6 +449,10 @@ class PetAnimator(QObject):
                 self._dance_total = 0
                 # 跳舞期间眨眼定时器是停着的，跳完要重新排，不然从此再也不眨
                 self._schedule_blink()
+        elif self.transforming:
+            self._tf += FPS_MS
+            if self._tf >= TF_MS:
+                self._tf = None       # 演完了，自动回到平常状态
         elif self.bouncing:
             self._bounce = min(1.0, self._bounce + FPS_MS / BOUNCE_MS)
         self.frame.emit()
@@ -240,6 +476,19 @@ class PetAnimator(QObject):
         if self.dancing:
             return 0.0, 0.0
         return self._gaze * GAZE_MAX_DEG, self._gaze * GAZE_MAX_SHIFT
+
+    @property
+    def transform_pose(self):
+        """变身那一层要画的东西（dict），没在变身就是 None。
+
+        是 property 不是方法 —— `gaze_pose` 就是在这个上头栽过一次：
+        pet.py 里写成 `gaze_pose()` 得到 `TypeError: 'tuple' object is not
+        callable`，而在 paintEvent 里抛异常 Qt 会**直接打死进程**（退出码 127，
+        没有任何 traceback）。
+        """
+        if not self.transforming:
+            return None
+        return transform_visual(self._tf)
 
     def _dance_played(self) -> int:
         """已经放到第几帧 —— **不取模**，只用来判断跳完没有。
@@ -300,6 +549,14 @@ class PetAnimator(QObject):
         breath = math.sin(self._t * 2 * math.pi / BREATH_PERIOD)
         sy = sx = 1.0
         dy = 0.0
+        # 变身期间她**悬浮**（hops）并且爆发那一下**放大**（pop）。两个都只往
+        # 上走，所以吃的是窗口上边距。弹跳那一路这时候是停的（transform() 把
+        # _bounce 归了 1.0，pounce() 也拒收），不会两边位移相加。
+        tf = self.transform_pose
+        if tf is not None:
+            dy -= tf["hops"]
+            sy += tf["pop"]
+            sx += tf["pop"]
         if self.bouncing:
             sy, sx, lift = _sample(self._bounce)
             # **一定要转成 -lift*HOP**，跟 `bounce_curve` 用同一个换算。

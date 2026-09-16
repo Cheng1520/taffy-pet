@@ -23,6 +23,7 @@ from PyQt5.QtWidgets import QApplication  # noqa: E402
 
 from taffy_pet import config as cfgmod  # noqa: E402
 from taffy_pet import anim as animmod  # noqa: E402
+from taffy_pet import voice as voicemod  # noqa: E402
 from taffy_pet.pet import PetWindow  # noqa: E402
 
 
@@ -88,6 +89,44 @@ def check_bounds(pet) -> bool:
     return ok
 
 
+def check_transform(pet) -> bool:
+    r"""变身全程：放大（pop）加悬浮（hops）之后她还留在窗口里吗。
+
+    这条是补的：以前没有任何测试走过变身，`check_bounds` 扫的是
+    `bounce_curve()`，那条曲线里根本没有 pop 和 hops。两个量各自都在安全
+    范围内，**加起来**才可能顶出边距 —— 分开看永远是绿的。
+    """
+    pw, ph = pet.sprite_ar * pet.disp_h, pet.disp_h
+    win_w, win_h = pet.width(), pet.height()
+    M, cx = pet.margin, pet.width() / 2.0
+    ok = True
+    worst = {"top": float("inf"), "bottom": float("-inf"),
+             "left": float("inf"), "right": float("-inf")}
+    ms = 0.0
+    while ms <= animmod.TF_MS:
+        v = animmod.transform_visual(ms)
+        sx = sy = 1.0 + v["pop"] + animmod.BREATH_AMP
+        dy = -v["hops"] * ph
+        half = pw / 2.0 * sx
+        worst["left"] = min(worst["left"], cx - half)
+        worst["right"] = max(worst["right"], cx + half)
+        worst["top"] = min(worst["top"], M + ph - ph * sy + dy)
+        worst["bottom"] = max(worst["bottom"], M + ph + dy)
+        ms += animmod.FPS_MS
+
+    if worst["left"] < 0 or worst["right"] > win_w:
+        print(f"  ✗ 变身横向溢出：{worst['left']:.1f} .. {worst['right']:.1f}（窗口宽 {win_w}）")
+        ok = False
+    if worst["top"] < 0 or worst["bottom"] > win_h:
+        print(f"  ✗ 变身纵向溢出：{worst['top']:.1f} .. {worst['bottom']:.1f}（窗口高 {win_h}）")
+        ok = False
+    if ok:
+        print(f"  ✓ 变身全程安全：x {worst['left']:.1f}..{worst['right']:.1f} / "
+              f"y {worst['top']:.1f}..{worst['bottom']:.1f}"
+              f"（窗口 {win_w}x{win_h}，边距 {M:.1f}）")
+    return ok
+
+
 def check_voice(pet) -> None:
     r"""语音库能不能真加载 —— **这块 test_units 故意不测**。
 
@@ -96,17 +135,28 @@ def check_voice(pet) -> None:
     wav 格式不认），所以放到冒烟测试里过一遍真 Qt。
 
     没有语音库**不算失败** —— 语音是附加值，仓库里本来就不带音频。
+    但**库在、点她却挑不出声**算失败：那是用户判断「这玩意儿到底有没有语音」的
+    唯一途径，而它靠库里有一条挂着 `GREETING` 触发词的条目 ——
+    「在呢」在旧库挂 01.wav、在新库挂 04.wav，换库时最容易漏的就是这条。
     """
     v = pet.voice
     if not v.entries:
         print(r"  - 没装语音库（%APPDATA%\TaffyPet\voice\），跳过")
-        return
+        return True
+    ok = True
     print(f"  ✓ 索引 {len(v.entries)} 条，建起 {len(v._effects)} 个播放器")
     if len(v._effects) != len(v.entries):
         print("  ✗ 有条目没能建成播放器（wav 格式不认？）")
-    hit = v.pick("别熬夜了，早点睡")
-    print(f"  ✓ 「别熬夜了」-> {hit['file'] if hit else '没挑到'}")
-    print(f"  ✓ 无关的话 -> {v.pick('今天天气不错') or '没挑到（对）'}")
+        ok = False
+    hit = v.pick(voicemod.GREETING)
+    if hit is None:
+        print(f"  ✗ 点她挑不出声：没有条目命中 {voicemod.GREETING!r}")
+        ok = False
+    else:
+        print(f"  ✓ 点她 -> {hit['file']}「{hit['text']}」")
+    miss = v.pick("今天天气不错")
+    print(f"  ✓ 无关的话 -> {miss['text'] if miss else '没挑到（对）'}")
+    return ok
 
 
 def main() -> int:
@@ -120,9 +170,10 @@ def main() -> int:
 
     print("边界检查：")
     bounds_ok = check_bounds(pet)
+    bounds_ok = check_transform(pet) and bounds_ok
 
     print("语音检查：")
-    check_voice(pet)
+    bounds_ok = check_voice(pet) and bounds_ok
 
     print("菜单检查：")
     try:
@@ -135,6 +186,14 @@ def main() -> int:
 
     def shot_open():
         pet.grab().save(str(out))
+        # 变身截在「维持」那一拍：那一拍有轮廓光 + 染色 + 光点，三样都在，
+        # 一张就能看出效果对不对（蓄力那几帧跟立绘几乎没区别）。
+        pet.animator.stop()
+        pet.animator._tf = float(animmod.TF_CHARGE_MS + animmod.TF_BURST_MS + 2400)
+        pet.repaint()
+        pet.grab().save(str(out.with_name("_smoke_transform.png")))
+        pet.animator._tf = None
+        pet.animator.start()
         pet.animator.pounce()
         # 压扁峰值在进度 0.13，拉伸峰值在 0.30
         QTimer.singleShot(int(0.13 * animmod.BOUNCE_MS), shot_squash)

@@ -69,6 +69,7 @@ from taffy_pet import agent
 from taffy_pet import anim as animmod
 from taffy_pet.chat_window import TYPING, ChatWindow
 from taffy_pet.pet import PetWindow
+from taffy_pet import voice as voicemod
 from taffy_pet.paths import VOICE_DIR
 
 # ---------- 画面 ----------
@@ -109,9 +110,9 @@ TOTAL = T_OUT[1]
 # 真的时间了，回复里再写一个对不上就成了自己打自己的脸。
 TALK_SPEECH = "关注塔菲喵关注塔菲谢谢喵"
 TALK_BALANCE = "余额 ¥42.00"       # 演示用的假数字，不是任何人的真实余额
-# 她自己找事做时冒出来的那句。**取自语音库里的原句**（voice/14.wav），不是编的 ——
+# 她自己找事做时冒出来的那句。**取自语音库里的原句**（voice/01.wav），不是编的 ——
 # 演示里出现的话要么是真的，要么就别出现。
-ALONE_LINE = "塔菲在看着你哦。"
+ALONE_LINE = "打游戏最重要的就是开心呀"
 
 DEMO_CFG = {
     # 没有 api_key。这一条是**故意的** —— 演示脚本不该有能力碰到用户的 Key
@@ -587,7 +588,7 @@ def _scene_alone(st: Stage, p: QPainter, t: float) -> None:
     这一段是「她自己找事做」的实拍，**不是在演一个举手势的动画**：她在真实运行里
     被闲置计时器叫醒时，做的就是这两件事 —— 蹦一下 + 冒一句话。
 
-    那句话是语音库里的**原句**（14.wav），不是编的。她说的时候头顶浮出那句话，
+    那句话是语音库里的**原句**（01.wav），不是编的。她说的时候头顶浮出那句话，
     是因为真机上就是这么做的：静音用户看不见声音，不写出来他只会看到
     「她莫名其妙弹了一下」。
     """
@@ -718,14 +719,27 @@ def main() -> int:
         return 0
 
     # 音效落在哪一秒。跟她动作对齐：点她之后 0.35 秒出声（跟气泡同时），
-    # 跳舞那段配一句，聊天里两条轨迹各配一句。
-    clips = [
-        (T_ALONE[0] + 1.3, "14.wav", 0.85),        # 「塔菲在看着你哦。」—— 她自己说的
-        (T_TALK[0] + 0.35, "01.wav", 0.85),        # 「在呢在呢，怎么啦喵。」
-        (T_DANCE[0] + 0.9, "03.wav", 0.85),        # 「雏草姬今天也要开心哦。」
-        (T_CHAT[0] + 10.6, "18.wav", 0.85),        # 「塔菲记得的。」—— 记事那条之后
-        (T_CHAT[0] + 15.2, "13.wav", 0.85),        # 「累了就早点休息喵。」
-    ]
+    # 跳舞那段配一句。
+    #
+    # **聊天那两处（记事之后、说累之后）故意不配音了。** 旧语音库是克隆的、
+    # 台词是编的，所以「塔菲记得的」「累了就早点休息喵」能正好对上那两句台词；
+    # 新库是她的**原声**，只有 12 句，没有能对上这两处的。
+    # 宁可空着 —— 配一句对不上的话，看着像 bug，不像彩蛋。
+    #
+    # 点她那一声**不写死文件名**：气泡里写的是 `TALK_SPEECH`，真程序那一下走的是
+    # `voice.play(TALK_SPEECH, GREETING)`，播的是匹配出来的那条。这里也用真库 +
+    # 真匹配逻辑算一遍，两边就不可能对不上。
+    # （第一版写死成 04.wav，可真程序点她播的是 06.wav「关注塔菲喵」—— 正好就是
+    # 气泡里那行字，视频反倒没把它演出来。）
+    talk_wav = (voicemod.pick_entry(voicemod.read_index(VOICE_DIR), TALK_SPEECH)
+                or {}).get("file")
+    if talk_wav is None:
+        print(f"[demo] 库里没有配得上 {TALK_SPEECH!r} 的台词，点她那一声会缺")
+    clips = [c for c in [
+        (T_ALONE[0] + 1.3, "01.wav", 0.85),   # 「打游戏最重要的就是开心呀」——她自己嘀咕
+        (T_TALK[0] + 0.35, talk_wav, 0.85),   # 点她的回应（跟气泡同一句）
+        (T_DANCE[0] + 0.9, "04.wav", 0.85),   # 跳舞时配一声喵
+    ] if c[1]]
     wav = out_dir / "taffy-demo.wav"
     build_audio(clips, wav)
 

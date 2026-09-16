@@ -5,16 +5,30 @@ r"""让她**出声** —— 从预渲染的语音库里挑一条最贴的播出�
 合成用的是 F5-TTS，跑在这台机器（CPU，无独显）上 RTF 28~57，也就是
 **一句两秒半的话要算 70~140 秒**。实时合成在这台机器上不存在任何折中方案。
 
-所以这里做的是另一件事：台词**事先渲染好**，回复进来时按关键词挑一条最像的播。
+所以这里做的是另一件事：台词**事先剪好**，回复进来时按关键词挑一条最像的播。
 挑不到就**不出声** —— 随便播一条不相关的话比安静更像 bug。
+
+### 库里是她的**原声**，不是克隆的
+
+早期版本用 F5-TTS / XTTS 克隆，出来的东西用户听了一句「雷霆声音」就否了。
+那不是调参问题：拿说话人验证（cam++）量，她真实录音的留一法区间是
+**0.602 ~ 0.853**，而**每一个**克隆输出都落在 0.405 ~ 0.545 —— 整批低于
+她自己录音的下限。克隆这条路在这台机器上没有出路，于是改成只用原声。
+
+现在的库是**从公开视频里按词级时间戳剪出来的真人片段**，一句一文件。
+来源是粉丝整理的语音包和「怪话怪叫」合集；直播录播本身没用 —— 那些是情境对话，
+剪出来就是「汪小母狗小母狗」这类，做不了台词。
+
+挑句子的标准、以及「像不像她」怎么量，在 `_work/` 下那几个构建期脚本里
+（`words.py` 按停顿切短语、`calib.py` 按片段长度标定门槛、`audit.py` 转写+打分）。
+**那些不随包发布**：`_work/` 被忽略，仓库里只有这份读取逻辑。
 
 ### 素材放哪
 
-语音库是**克隆真人（永雏塔菲）声音**的产物，只做本机自用。
 它住在用户数据目录 `%APPDATA%\TaffyPet\voice\`（见 `paths.VOICE_DIR`），
 **不进版本库，但会打进安装包** —— 要的是「GitHub 上发出去的安装包装完和本机一致」。
-仓库里只有生成它的管线（`taffy_lib.py`）和这份读取逻辑，音频本身被 `/voice/` 忽略掉，
-再由 `installer\taffy-pet.iss` 收进安装程序。README 顶上有对应的免责声明。
+音频本身被 `/voice/` 忽略掉，再由 `installer\taffy-pet.iss` 收进安装程序。
+README 顶上有对应的免责声明。
 
 语音库的结构：
 
@@ -40,7 +54,12 @@ MIN_TRIGGER = 2
 #
 # `speech`（默认「关注塔菲喵关注塔菲谢谢喵」）是用户自己配的文案，跟语音库的
 # 触发词没有任何约定关系，对不上才是常态。所以点击时拿它当**首选**，
-# 挑不出来再退到这句。「在呢」是 01.wav 的触发词之一，正常情况下必然挑得出。
+# 挑不出来再退到这句 —— 而点她**必须出声**，那是用户判断「这玩意儿到底有没有
+# 语音」的唯一途径。
+#
+# 「在呢」挂在 04.wav（一声喵）的触发词上。触发词是**匹配用的，不是转写**：
+# 被打招呼就喵一声，本来就是猫的正确反应。那一条的 `text` 仍是真实转写「喵喵喵」。
+# 换语音库时记得核这条 —— 新库里没有任何触发词命中「在呢」的话，点她就哑了。
 GREETING = "在呢在呢"
 
 
@@ -75,6 +94,24 @@ def read_index(d) -> list:
                          if isinstance(t, str) and len(t) >= MIN_TRIGGER]
         out.append(e)
     return out
+
+
+def pick_entry(entries: list, text: str):
+    r"""从 `entries` 里挑一条最贴 `text` 的，挑不到返回 None。
+
+    **和 Qt 分开**，跟 `read_index` 一样是纯函数 —— `tools\demo.py` 拿它算
+    「真程序在这一句话上会播哪一条」。演示里播的必须是真程序会播的那一段，
+    写死文件名的话库里一换台词，视频就开始演示一个不存在的行为。
+
+    **命中最长的触发词优先**（并列时取索引靠前的）。
+    长的更具体：「别熬夜了」比「了」有信息量得多。
+    """
+    best, score = None, 0
+    for e in entries:
+        for t in e["triggers"]:
+            if t in text and len(t) > score:
+                best, score = e, len(t)
+    return best
 
 
 class Voice:
@@ -121,17 +158,8 @@ class Voice:
         return bool(self._effects) and bool(self.cfg.get("voice", True))
 
     def pick(self, text: str):
-        r"""挑一条最贴的，挑不到返回 None。
-
-        **命中最长的触发词优先**（并列时取索引靠前的）。
-        长的更具体：「别熬夜了」比「了」有信息量得多。
-        """
-        best, score = None, 0
-        for e in self.entries:
-            for t in e["triggers"]:
-                if t in text and len(t) > score:
-                    best, score = e, len(t)
-        return best
+        r"""挑一条最贴的，挑不到返回 None。判据见 `pick_entry`。"""
+        return pick_entry(self.entries, text)
 
     def play_entry(self, entry: dict) -> bool:
         r"""直接播某一条，不做关键词匹配。播了返回 True。

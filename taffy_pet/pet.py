@@ -7,8 +7,8 @@ import json
 import random
 
 from PyQt5.QtCore import Qt, QRectF, QTimer
-from PyQt5.QtGui import (QBrush, QColor, QCursor, QGradient, QPainter, QPixmap,
-                         QRadialGradient)
+from PyQt5.QtGui import (QBrush, QColor, QCursor, QGradient, QPainter, QPen,
+                         QPixmap, QRadialGradient)
 from PyQt5.QtWidgets import QApplication, QInputDialog, QLineEdit, QMenu, QWidget
 
 from . import config as cfgmod
@@ -49,6 +49,19 @@ SHADOW_LIFT_FADE = 0.45    # 跳到最高点时淡掉的比例
 # 写死像素不行：窗口宽度跟着 config 的 height 走，把角色调大一点，
 # 「完全转向」的距离就该跟着变远，否则一大就再也不转了。
 GAZE_REACH = 3.0
+
+# 变身用的金。挑金色而不是粉色，是因为她本来就是粉的 —— 同色系的光打在她
+# 身上看不出来，读起来只是「这张图变亮了」。金色跟她的粉发、棕裙子都岔开，
+# 而且浅色桌面和深色桌面上都立得住。
+TF_GLOW_RGB = (255, 214, 130)
+TF_TINT_RGB = (255, 232, 186)
+# 轮廓光比身上那层**饱和得多**。它只露在她轮廓外面，画在透明上，
+# 所以是什么色就显示什么色 —— 用身上那层淡金只会得到一圈奶白。
+TF_RIM_RGB = (255, 198, 88)
+
+# 轮廓光的三圈：横向/纵向放大倍数 + 相对亮度。纵向一律压得比横向小 ——
+# 素材顶到窗口上沿，纵向没有余量（见 paintEvent 里的说明）。
+TF_RIM = ((1.06, 1.020, 0.95), (1.12, 1.045, 0.50), (1.19, 1.065, 0.26))
 
 
 class PetWindow(QWidget):
@@ -105,6 +118,16 @@ class PetWindow(QWidget):
         self.animator.start()
 
         self._shadow = self._make_shadow()
+        # 变身的素材，都是一次性烘好的：一颗金色光点（缩小了当飞的光点），
+        # 以及她的剪影 —— 剪影有两个用处，贴着她的轮廓放大一圈是**轮廓光**，
+        # 原尺寸叠在身上是**染色**。两者要的颜色不一样，所以各烘一份。
+        self._glow = self._make_glow()
+        self._tint_pix = self._make_tint(self.pix, TF_TINT_RGB)
+        self._tint_blink = self._make_tint(self.pix_blink, TF_TINT_RGB)
+        # 轮廓光单独一张、颜色也更饱和：它叠在**透明**上（只露出她轮廓外面的
+        # 那一圈），所以画什么色就是什么色，用身上那层淡金就只剩一圈奶白。
+        self._rim_pix = self._make_tint(self.pix, TF_RIM_RGB)
+        self._rim_blink = self._make_tint(self.pix_blink, TF_RIM_RGB)
 
         # 她自己找事做。存在的理由见 anim.IDLE_ACTIONS —— 简言之：没人会
         # 对桌宠右键，所以跳舞得她自己演。
@@ -234,6 +257,57 @@ class PetWindow(QWidget):
         p.end()
         return pm
 
+    def _make_glow(self) -> QPixmap:
+        r"""烘一颗金色的光点。变身时飞的那些就是它缩小画的。
+
+        跟影子同一条理由：形状永远一样，每帧变的只有大小和透明度。现画渐变的话
+        14 个光点每帧就是 14 次渐变重建，50fps 下每秒 700 次，白花的。
+
+        **中心不能再偏白了**。它以前还兼着「背后那团光晕」的活儿，那时候心偏白
+        是对的（一大团纯金会发闷）；现在只用来画光点，而光点是画在**桌面上**的
+        ——浅色的壁纸本来就是白的，奶白的点落在上面直接看不见。饱和的金才有对比。
+        """
+        n = 256
+        pm = QPixmap(n, n)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        g = QRadialGradient(0.5, 0.5, 0.5)
+        g.setCoordinateMode(QGradient.ObjectBoundingMode)
+        g.setColorAt(0.0, QColor(255, 244, 190, 255))
+        g.setColorAt(0.30, QColor(255, 216, 120, 235))
+        g.setColorAt(0.65, QColor(255, 190, 80, 90))
+        g.setColorAt(1.0, QColor(255, 180, 60, 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(g))
+        # 内缩 1px：抗锯齿的边缘正好压在边界上会被裁掉，看着像刀切的
+        p.drawEllipse(QRectF(1, 1, n - 2, n - 2))
+        p.end()
+        return pm
+
+    def _make_tint(self, src: QPixmap, rgb: tuple) -> QPixmap:
+        r"""把一张立绘压成**纯色剪影**（保留原来的 alpha）。
+
+        `CompositionMode_SourceIn`：只保留「源」里目标 alpha 不为 0 的地方，
+        也就是拿她的轮廓当模子，把整块颜色裁成她的形状。
+
+        为什么不直接画一块半透明色矩形盖上去：那会把窗口里她周围的透明区域
+        也一起染了，等于给整只角色套了个方形的黄色罩子。
+
+        **传参而不是直接读 self.pix**：闭眼那张的剪影得跟闭眼那张配。拿睁眼的
+        剪影盖在闭眼立绘上，变身的几百毫秒里她会睁着眼眨一次。
+
+        `rgb` 也是参数：身上那层是淡金、轮廓光那层是饱和金，两处要的颜色不一样。
+        """
+        pm = QPixmap(src.size())
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.drawPixmap(0, 0, src)
+        p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        p.fillRect(pm.rect(), QColor(*rgb))
+        p.end()
+        return pm
+
     def _update_gaze(self) -> None:
         r"""把「鼠标在她哪一侧」告诉动画器。
 
@@ -273,10 +347,18 @@ class PetWindow(QWidget):
         # 窗口一边，拖动时手感和落点对不上。
         dest_w = ar * self.disp_h
         left = m + (self.disp_w - dest_w) / 2.0
+        # 变身那一层。**是 property，别写成 tf()** —— 同 `gaze_pose`，多一对括号
+        # 就是 TypeError，而 paintEvent 里的异常会被 Qt 变成静默退出码 127。
+        tf = self.animator.transform_pose
+        ax, ay = w / 2.0, h - m               # 脚底中心，光晕/环/光点都锚在这
 
         # 影子先画。它**不跟着倾斜**：影子是落在地面上的东西，跟着人一起歪
         # 就变成贴在她身上的一块黑。横向跟着 shift 走一点，但幅度比人小一半，
         # 那点差值就是「她在动、地面没动」。
+        #
+        # 变身时她悬浮（dy 里多了 hops），这里照样按 -dy/HOP 算离地比例，
+        # 于是影子自己就跟着缩小变淡 —— 「离地多高」这条线索是同一个，
+        # 不用给变身单开一套。
         lift = max(0.0, -dy / HOP) if HOP else 0.0
         sw = dest_w * SHADOW_W_RATIO * (1.0 - SHADOW_LIFT_SHRINK * lift)
         if sw >= 2.0:
@@ -289,13 +371,86 @@ class PetWindow(QWidget):
                          self._shadow, QRectF(self._shadow.rect()))
             p.setOpacity(1.0)
 
+        # 冲击环。在影子之后、人之前 —— 它得像是从她身上扫出来的，
+        # 压在人后面才有「从这儿发出去」的方向感。
+        if tf is not None and tf["ring"] is not None:
+            rad, alpha = tf["ring"]
+            r = rad * dest_w
+            if r > 2.0 and alpha > 0.01:
+                pen = QPen(QColor(*TF_GLOW_RGB, 255))
+                # 往外扫的同时变细：冲击波散开就是会变薄，等宽看着像呼啦圈
+                pen.setWidthF(max(1.5, dest_w * 0.045 * (1.0 - min(1.0, rad / 2.3))))
+                p.setOpacity(alpha)
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(QRectF(ax - r, ay - self.disp_h * 0.5 - r,
+                                     r * 2.0, r * 2.0))
+                p.setOpacity(1.0)
+
+        p.save()
         p.translate(w / 2.0, h - m)           # 锚点：底部中心
         # 倾斜也绕这个锚点 —— 绕腰或绕中心的话脚会离开地面，看着像飘着转
         p.rotate(lean_deg)
         p.translate(shift * dest_w, 0.0)
         p.scale(sx, sy)
         p.translate(-w / 2.0, -(h - m) + dy * self.disp_h)
+
+        # 轮廓光：把她的剪影放大一圈、用**加法**叠在人后面，露在她边上的那一圈
+        # 就是「她在发光」。
+        #
+        # 为什么不做成一团圆光晕垫在背后（第一版就是）：窗口只比角色宽出 margin
+        # （6.5%）。任何在窗口边上还有可见亮度的圆形光晕，落到桌面上看都是一个
+        # **发光的方块** —— 渐变是被窗口矩形硬切掉的；而缩到能整团塞进窗口，
+        # 它又比人还窄，整个被挡在身后，等于没画。贴着轮廓的一圈光没这个问题，
+        # 它的形状就是她本人，切不出直边。
+        #
+        # 用加法而不是直接盖色：盖色（SourceOver）会拿淡金换掉她的脸、头发、
+        # 裙子，整个人变成一块平的色斑，素材白瞎了。加法只往上加亮，暗处染金、
+        # 亮处更亮，五官和衣服的层次都还在。
+        #
+        # 三圈递减而不是一圈：单圈就是一条硬边的金线，像贴纸描边；叠三圈拉开
+        # 层次才像光散出来。三张 drawPixmap，跟原来一团渐变一个量级。
+        #
+        # 放大倍数卡在 1.07 以内是**边界**逼出来的：她的呆毛顶在素材最上沿，
+        # 纵向放大 7% 就顶到窗口上边（margin 正好 6.5%）。
+        if tf is not None and tf["glow"] > 0.01 and dance_i is None:
+            rim = self._rim_blink if blinking else self._rim_pix
+            for kx, ky, ka in TF_RIM:
+                rw, rh = dest_w * kx, self.disp_h * ky
+                p.setCompositionMode(QPainter.CompositionMode_Plus)
+                p.setOpacity(tf["glow"] * ka)
+                # 以**脚底中心**为锚点放大：绕中心放大的话脚会离地，她看着在飘
+                p.drawPixmap(QRectF(left - (rw - dest_w) / 2.0,
+                                    m + self.disp_h - rh, rw, rh),
+                             rim, src_rect)
+            p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            p.setOpacity(1.0)
+
         p.drawPixmap(QRectF(left, m, dest_w, self.disp_h), src, src_rect)
+        # 染色盖在她身上，**必须跟立绘共用同一套变换和目标矩形**：另外算一遍的话
+        # 两份矩形差半个像素，边上就会露出一圈原来的颜色，像描了道脏边。
+        # 所以它在 save/restore 里面，而且直接复用 left/m/dest_w/disp_h。
+        if tf is not None and tf["tint"] > 0.01 and dance_i is None:
+            p.setOpacity(tf["tint"])
+            p.drawPixmap(QRectF(left, m, dest_w, self.disp_h),
+                         self._tint_blink if blinking else self._tint_pix,
+                         src_rect)
+            p.setOpacity(1.0)
+        p.restore()
+
+        # 光点最后画，压在整个人**上面**。放背后的话会被裙子挡掉大半，
+        # 只剩边缘几颗露着，看着像画面脏了而不是在发光。
+        if tf is not None:
+            sr = QRectF(self._glow.rect())
+            for sx_, sy_, rr, aa in tf["sparks"]:
+                if aa <= 0.01:
+                    continue
+                rad = max(1.5, rr * dest_w)
+                px_, py_ = ax + sx_ * dest_w, ay + sy_ * self.disp_h
+                p.setOpacity(aa)
+                p.drawPixmap(QRectF(px_ - rad, py_ - rad, rad * 2.0, rad * 2.0),
+                             self._glow, sr)
+            p.setOpacity(1.0)
 
     # ---------- 交互 ----------
     def mousePressEvent(self, e) -> None:
@@ -380,6 +535,10 @@ class PetWindow(QWidget):
             dance.setText("跳个舞（没装舞蹈素材）")
         dance.triggered.connect(self.do_dance)
 
+        tf = m.addAction("变身")
+        tf.setToolTip("她整个人泛金光、浮起来几秒。没人理她的时候偶尔也会自己来一次")
+        tf.triggered.connect(self.do_transform)
+
         blink = m.addAction("眨眼")
         blink.setCheckable(True)
         blink.setChecked(self.animator.blink_enabled)
@@ -425,6 +584,14 @@ class PetWindow(QWidget):
         self.animator.dance(int(self.dance_meta["frames"]),
                             float(self.dance_meta.get("fps", 15.0)))
 
+    def do_transform(self) -> None:
+        """变身。不需要任何素材 —— 光晕、冲击环、光点、染色都是画出来的。
+
+        素材只用到立绘本身，所以没有 `pix_dance is None` 那种「没装就不能用」
+        的分支，菜单项永远可点。
+        """
+        self.animator.transform()
+
     # ---------- 她自己找事做 ----------
     def _restart_idle(self) -> None:
         r"""重新排一次「她自己找事做」。
@@ -464,6 +631,12 @@ class PetWindow(QWidget):
 
         if action == "dance":
             self.do_dance()
+            return
+
+        # 变身也是「整段演出」，跟跳舞一样直接走人 —— 底下那套「弹一下再说话」
+        # 是给 say / hop 用的，套在变身后面等于变完身再蹦一下。
+        if action == "transform":
+            self.do_transform()
             return
 
         # 「说话」和「蹦」都从弹一下开始 —— 只有气泡没有动作的话，静音用户看到的

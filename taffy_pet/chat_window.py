@@ -8,7 +8,9 @@ import shutil
 import sys
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, QRectF, QTimer
+from PyQt5.QtCore import Qt, QRectF, QSize, QTimer
+# QColor 这一版在模块里已经没人直接用了，但**不能删**：测试按 `CW.QColor` 造一个
+# 正常撞不上的颜色再塞回 CW.TEXT，看气泡文字跟不跟着换（case_bubbles_painted）。
 from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
                              QMessageBox, QPushButton, QScrollArea,
@@ -19,27 +21,35 @@ from . import chat as chatmod
 from . import chat_store
 from . import config as cfgmod
 from . import memory
+from . import theme
 from .paths import ASSETS, PERSONA_DEFAULT, PERSONA_PATH
 # 配色只有这一个来源（计划的 Global Constraints）：气泡那四个常量直接引用 toast 的，
 # QSS 里的字面量也从它们拼出来。以前这里是手抄的一份，抄漏了两处 —— 窗口底色和系统
 # 提示文字跟 toast 已经对不上了，而「以后改桌宠配色聊天窗跟着变」这件事完全没保证。
 # 注意 toast.BG 带 α244（气泡是半透明的），聊天窗不需要半透明底，所以 .name() 取的是
 # 不带 α 的那个十六进制串；别用 HexArgb，那会把 244 一起带进来。
+#
+# Task 8 之后除这四档之外的暖色（输入区、轨迹线、玫瑰粉…）统一挪进 theme.py ——
+# 这一层名字**不改**：`CW.BG` / `CW.TEXT` 是测试和 demo 直接摸的接口，
+# case_bubbles_painted 还会把 CW.TEXT 换掉再看气泡跟不跟。
 from .toast import BG, BORDER, TEXT, DIM
 
-BUBBLE_R = 14          # 气泡圆角
-TAIL_W = 10            # 尾巴根部宽
-TAIL_H = 9             # 尾巴伸出高度
-PAD_X = 13             # 气泡内边距
-PAD_Y = 9
-HERS_BG = QColor(255, 255, 255)        # 她的气泡是实心白，跟 toast 的半透明底不是一回事
+BUBBLE_R = 16          # 气泡圆角
+TAIL_W = 9             # 尾巴根部宽
+TAIL_H = 8             # 尾巴伸出高度
+PAD_X = 14             # 气泡内边距（比上一版各多 1px，两行字贴在一起太挤）
+PAD_Y = 10
+# 贴尾巴那一侧的圆角收小，另一侧放圆 —— 这是「谁在说话」在**形状**上的记号，
+# 比只靠颜色区分稳（色弱、截图缩放之后颜色会糊，形状不会）。
+CORNER_TAIL = 6        # 尾巴那侧的角
+HERS_BG = theme.CARD                   # 她的气泡是暖白实心卡，跟 toast 的半透明底不是一回事
 HERS_LINE = BORDER                     # 气泡描边跟 toast 同一个来源
-MINE_BG = QColor(228, 150, 175)        # 用户气泡的粉底，toast 里没有对应物
-MINE_LINE = QColor(221, 134, 163)      # 它的描边
-BAR_BG = QColor(255, 246, 242)         # 底下那条输入区的底色
-BAR_LINE = QColor(246, 223, 230)       # 输入区上边线
-BTN_BUSY = QColor(185, 174, 180)       # 忙时按钮（灰掉，它现在是「停止」）
-BTN_BUSY_HOVER = QColor(169, 158, 164)
+MINE_BG = theme.MINE                   # 用户气泡的粉底，toast 里没有对应物
+MINE_LINE = theme.MINE_EDGE            # 它的描边
+BAR_BG = theme.BAR                     # 底下那条输入区的底色
+BAR_LINE = theme.BAR_EDGE              # 输入区上边线
+BTN_BUSY = theme.GHOST                 # 忙时按钮（灰掉，它现在是「停止」）
+BTN_BUSY_HOVER = theme.GHOST_HOVER
 
 AVATAR_H = 56          # 头像立绘的高度；宽度按原图比例走，不固定
 
@@ -76,36 +86,43 @@ DAY_OBJECT = "daySeparator"
 # QSS 里的 {} 是它自己的语法，写在这个 f-string 里得翻倍
 QSS = f"""
 #chatRoot, QScrollArea, #chatArea {{ background: {BG.name()}; }}
-QScrollBar:vertical {{ background: transparent; width: 8px; margin: 4px 2px 4px 0; }}
+QScrollBar:vertical {{ background: transparent; width: 8px; margin: 8px 2px 8px 0; }}
 QScrollBar::handle:vertical {{
     background: rgba({BORDER.red()}, {BORDER.green()}, {BORDER.blue()}, 150);
-    border-radius: 4px; min-height: 30px;
+    border-radius: 3px; min-height: 32px;
 }}
 QScrollBar::handle:vertical:hover {{
-    background: rgba({MINE_BG.red()}, {MINE_BG.green()}, {MINE_BG.blue()}, 210);
+    background: rgba({MINE_BG.red()}, {MINE_BG.green()}, {MINE_BG.blue()}, 190);
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+#chatBar {{ background: {BAR_BG.name()}; border-top: 1px solid {BAR_LINE.name()}; }}
 #chatInput {{
-    background: #FFFFFF; border: 1.4px solid {BORDER.name()}; border-radius: 12px;
-    padding: 6px 10px; color: {TEXT.name()};
+    background: {theme.FIELD.name()}; border: 1.4px solid {theme.FIELD_EDGE.name()};
+    border-radius: 16px; padding: 8px 12px; color: {TEXT.name()};
+    selection-background-color: {MINE_BG.name()}; selection-color: {theme.MINE_INK.name()};
 }}
-#chatInput:focus {{ border: 1.4px solid {MINE_BG.name()}; }}
+#chatInput:focus {{ border: 1.4px solid {theme.FIELD_FOCUS.name()}; }}
 #sendBtn {{
-    background: {MINE_BG.name()}; color: #FFFFFF; border: none; border-radius: 12px;
+    background: {MINE_BG.name()}; color: {theme.MINE_INK.name()};
+    border: none; border-radius: 15px;
+    font-family: 'Microsoft YaHei UI'; font-size: 10pt;
 }}
 #sendBtn:hover {{ background: {MINE_LINE.name()}; }}
+#sendBtn:pressed {{ background: {theme.MINE_DEEP.name()}; }}
 #sendBtn[busy="true"] {{ background: {BTN_BUSY.name()}; }}
 #sendBtn[busy="true"]:hover {{ background: {BTN_BUSY_HOVER.name()}; }}
-#chatBar {{ background: {BAR_BG.name()}; border-top: 1px solid {BAR_LINE.name()}; }}
+#suggestBar {{ background: {BAR_BG.name()}; }}
 #suggestBtn {{
-    background: #FFFFFF; color: {TEXT.name()}; border: 1px solid {BORDER.name()};
-    border-radius: 11px; padding: 4px 9px;
+    background: {theme.CHIP.name()}; color: {TEXT.name()};
+    border: 1px solid {theme.CHIP_EDGE.name()}; border-radius: 13px; padding: 4px 9px;
     font-family: 'Microsoft YaHei UI'; font-size: 8.5pt;
 }}
-#suggestBtn:hover {{ background: {MINE_BG.name()}; color: #FFFFFF; border-color: {MINE_LINE.name()}; }}
-#suggestBtn:pressed {{ background: {MINE_LINE.name()}; }}
-#suggestBar {{ background: {BAR_BG.name()}; }}
+#suggestBtn:hover {{
+    background: {MINE_BG.name()}; color: {theme.MINE_INK.name()};
+    border-color: {MINE_LINE.name()};
+}}
+#suggestBtn:pressed {{ background: {MINE_LINE.name()}; border-color: {MINE_LINE.name()}; }}
 """
 
 _AVATAR = None         # 头像立绘的惰性缓存，见 _avatar_pixmap()
@@ -141,6 +158,54 @@ class ChatInput(QTextEdit):
         super().keyPressEvent(e)
 
 
+def _round_rect(r: QRectF, tl: float, tr: float, br: float, bl: float) -> QPainterPath:
+    r"""四个角**各画各的**圆角矩形。
+
+    QPainterPath.addRoundedRect 四个角只能一样大，而气泡要的是「贴着尾巴那一侧
+    收小」—— 那是「谁在说话」的形状记号。手搓一遍 arcTo：角度按 Qt 的老规矩，
+    0° 在三点钟、逆时针为正，所以每一段都从 -90° 扫过去。
+    """
+    p = QPainterPath()
+    p.moveTo(r.left() + tl, r.top())
+    p.lineTo(r.right() - tr, r.top())
+    if tr:
+        p.arcTo(QRectF(r.right() - 2 * tr, r.top(), 2 * tr, 2 * tr), 90, -90)
+    p.lineTo(r.right(), r.bottom() - br)
+    if br:
+        p.arcTo(QRectF(r.right() - 2 * br, r.bottom() - 2 * br, 2 * br, 2 * br), 0, -90)
+    p.lineTo(r.left() + bl, r.bottom())
+    if bl:
+        p.arcTo(QRectF(r.left(), r.bottom() - 2 * bl, 2 * bl, 2 * bl), 270, -90)
+    p.lineTo(r.left(), r.top() + tl)
+    if tl:
+        p.arcTo(QRectF(r.left(), r.top(), 2 * tl, 2 * tl), 180, -90)
+    p.closeSubpath()
+    return p
+
+
+class _Body(QLabel):
+    r"""气泡里的正文。
+
+    唯一的作用是**改掉 sizeHint 的宽度**：QLabel 打开 wordWrap 之后会自己搜一个
+    「高度最小的最窄宽度」，短句常常被当成两行折 —— 折出来的第二行只有两三个字，
+    右边还空着一大块，整条气泡看着像没对齐。这儿直接报「最长那一行的整行宽度」，
+    一行放得下就不折；真超过气泡宽度上限时，超出的部分由布局走 heightForWidth
+    重新算高度（QLabel::setWordWrap 会把 heightForWidth 打开），照样折得对。
+
+    +2 是**故意留的**：宽度正好等于文字宽度时 QLabel 会因为亚像素误差折行，
+    留两像素的余量它才肯老老实实放一行。
+    """
+
+    PAD = 2
+
+    def sizeHint(self) -> QSize:
+        fm = self.fontMetrics()
+        lines = (self.text() or " ").split("\n")
+        w = max(fm.horizontalAdvance(ln) for ln in lines)
+        # 高度按不折行算：宽度没被砍时就是这个高度；被砍了走 heightForWidth。
+        return QSize(w + self.PAD, fm.height() * len(lines))
+
+
 class _Bubble(QWidget):
     """一个气泡。圆角矩形加一条小尾巴，尾巴只给她的消息 —— 用户的消息靠右，
     右边贴边没有空间伸尾巴，而且有头像的一侧本来就需要这个锚点。
@@ -155,17 +220,21 @@ class _Bubble(QWidget):
         # 她调工具留下的那几行小字（`_Trace` 控件）。**只有这一个列表** ——
         # 落盘时从控件的 text() 现读，不另存一份字符串，两份迟早对不上。
         self.traces = []
-        self._label = QLabel(text, self)
+        self._label = _Body(text, self)
         self._label.setWordWrap(True)
         self._label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self._label.setFont(QFont("Microsoft YaHei UI", 10))
         # 打字动画那几帧宽度不等，钉住最宽的那帧。见 set_text。
-        self._pin_w = self._label.fontMetrics().horizontalAdvance(TYPING_FRAMES[-1])
+        # 那个 +PAD 跟 _Body.sizeHint 是同一笔余量 —— 少加的话钉住的那一帧会被
+        # sizeHint 顶宽 2px，气泡照样一格一胀。
+        self._pin_w = (self._label.fontMetrics().horizontalAdvance(TYPING_FRAMES[-1])
+                       + _Body.PAD)
         # 她的气泡文字跟 toast 同一个来源（这条 inline stylesheet 独立于模块级 QSS，
         # 手抄一份的话「改桌宠配色聊天窗跟着变」就又断在这儿）。白字那半边没有对应物：
         # 粉底上的白字 toast 里不存在，写死。
         self._label.setStyleSheet(
-            f"color: {'#FFFFFF' if mine else TEXT.name()}; background: transparent;")
+            f"color: {theme.MINE_INK.name() if mine else TEXT.name()};"
+            " background: transparent;")
 
         lay = QVBoxLayout(self)
         left = PAD_X if mine else PAD_X + TAIL_W
@@ -198,11 +267,16 @@ class _Bubble(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         x = 0 if self.mine else TAIL_W
         body = QRectF(x + 0.5, 0.5, self.width() - x - 1, self.height() - 1)
-        path = QPainterPath()
-        path.addRoundedRect(body, BUBBLE_R, BUBBLE_R)
-        if not self.mine:
+        if self.mine:
+            # 我这边靠右：尾巴那侧是右下角，收小一圈
+            path = _round_rect(body, BUBBLE_R, BUBBLE_R, CORNER_TAIL, BUBBLE_R)
+        else:
+            path = _round_rect(body, CORNER_TAIL, BUBBLE_R, BUBBLE_R, BUBBLE_R)
+            # 尾巴尖对准**第一行字的竖直中点**，指回左边的头像。写死一个偏移量
+            # 会错：正文那个 QLabel 自己上下还带一截留白，一行字的中点在 PAD_Y 往下
+            # 半行的地方，不是 PAD_Y。矮气泡（「…」那一档只有一行）再压到一半高度。
             tail = QPainterPath()
-            y = min(PAD_Y + 10.0, body.height() / 2)
+            y = min(PAD_Y + self._label.fontMetrics().height() / 2.0, body.height() / 2)
             tail.moveTo(body.left() - TAIL_H + 1, y)
             tail.lineTo(body.left() + 1, y - TAIL_W / 2)
             tail.lineTo(body.left() + 1, y + TAIL_W / 2)
@@ -220,6 +294,58 @@ class _Trace(QLabel):
     `resizeEvent` 里要一次把所有轨迹行的宽度上限都刷一遍，混在普通 QLabel 里
     挑不出来（日期分隔线、系统提示也都是 QLabel）。
     """
+
+
+class _Avatar(QLabel):
+    """她的头像。
+
+    就是 `_avatar_pixmap()` 那张立绘（26×56 的全身像，比例不动），只是在它**背后**
+    垫一块淡淡的粉 —— 立绘自己是透明底的，直接贴在奶油色消息区上时，她那身深色
+    马甲会看着像一小块脏点；垫一层同色系的圆角之后它才像「一枚头像」而不是「一块
+    没抠干净的图」。
+
+    单独一个类只为这个 paintEvent。控件尺寸仍然是立绘的尺寸（测试按这个查
+    「头像框贴不贴立绘」，见 case_bubbles_painted），所以这块底不额外占宽。
+    """
+
+    def paintEvent(self, e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
+        p.setPen(Qt.NoPen)
+        p.setBrush(theme.AVATAR_BG)
+        p.drawRoundedRect(r, 12, 12)
+        p.setPen(QPen(theme.AVATAR_EDGE, 1.2))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(r, 12, 12)
+        super().paintEvent(e)
+
+
+class _Day(QLabel):
+    """日期分隔线：一颗居中的小胶囊。
+
+    直接一段灰字悬在消息中间太像「一条内容」，而它其实是个**路标**。给它一块
+    自己的底，跟气泡、轨迹行区分开。
+
+    仍是 QLabel 的子类、仍然直接把 objectName 打在自己身上 —— 测试按
+    `msgs` 顶层控件的 objectName 认它（`texts()` / `rows()` / case_day_separator），
+    套一层容器就全认不出来了。
+    """
+
+    def paintEvent(self, e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        fm = self.fontMetrics()
+        w = fm.horizontalAdvance(self.text()) + 26
+        h = fm.height() + 8
+        # 画在 contentsRect 里，不是整个控件里 —— 上下那点留白是
+        # setContentsMargins 加的，字也跟着它缩，胶囊得跟着同一块矩形才对得齐。
+        cr = self.contentsRect()
+        r = QRectF(cr.center().x() - w / 2.0, cr.center().y() - h / 2.0, w, h)
+        p.setPen(Qt.NoPen)
+        p.setBrush(theme.DAY_BG)
+        p.drawRoundedRect(r, h / 2.0, h / 2.0)
+        super().paintEvent(e)
 
 
 def day_label(ts: str) -> str:
@@ -358,8 +484,8 @@ class ChatWindow(QWidget):
         self.area = QWidget()
         self.area.setObjectName("chatArea")
         self.msgs = QVBoxLayout(self.area)
-        self.msgs.setContentsMargins(14, 14, 14, 14)
-        self.msgs.setSpacing(10)
+        self.msgs.setContentsMargins(16, 16, 16, 16)
+        self.msgs.setSpacing(12)
         self.msgs.addStretch(1)                  # 消息从上面排起，这个弹簧永远在最末
         self.scroll.setWidget(self.area)
         root.addWidget(self.scroll, 1)
@@ -372,23 +498,33 @@ class ChatWindow(QWidget):
         bar = QWidget()
         bar.setObjectName("chatBar")
         row = QHBoxLayout(bar)
-        row.setContentsMargins(14, 10, 14, 12)
-        row.setSpacing(8)
+        row.setContentsMargins(14, 12, 14, 12)
+        row.setSpacing(10)
         self.input = ChatInput(self.send)
         self.input.setObjectName("chatInput")
-        self.input.setPlaceholderText("和 taffy 说点什么…（回车发送，Shift+回车换行）")
-        self.input.setFixedHeight(72)
+        # 提示语**必须短**：最窄的 420 宽窗口里，输入框的可用文本宽只有约 268px，
+        # 而「和 taffy 说点什么…（回车发送，Shift+回车换行）」量出来是 423px ——
+        # 超了 1.6 倍，任何窗口宽度下都折成两行，占满输入框还挤掉了首行。
+        # 两条快捷键提示挪到 tooltip：常看常烦的东西不该常驻，但也不能丢。
+        self.input.setPlaceholderText("和 taffy 说点什么…")
+        self.input.setToolTip("回车发送，Shift+回车换行")
+        self.input.setFixedHeight(68)
         row.addWidget(self.input, 1)
 
         self.btn = QPushButton("发送")
         self.btn.setObjectName("sendBtn")
-        self.btn.setFixedSize(72, 72)
+        # 不再是 72×72 的方块 —— 跟输入框同高的话它是一整块粉色，压得比输入框还重。
+        # 78×44 的圆角片，竖直居中在输入框旁边，视觉重量刚好反过来。
+        self.btn.setFixedSize(78, 44)
+        self.btn.setCursor(Qt.PointingHandCursor)
         self.btn.clicked.connect(self._on_button)
         row.addWidget(self.btn)
-        root.addWidget(bar)
 
+        # 快捷开场在输入框**上面**：它是「帮你开口」的一句话，不是输入区的一部分，
+        # 挤在发送按钮下面会跟输入框抢位置。
         self.suggests = self._build_suggests()
         root.addWidget(self.suggests)
+        root.addWidget(bar)
 
         self.setStyleSheet(QSS)
 
@@ -397,8 +533,14 @@ class ChatWindow(QWidget):
         wrap = QWidget()
         wrap.setObjectName("suggestBar")
         row = QHBoxLayout(wrap)
-        row.setContentsMargins(14, 0, 14, 10)
+        # 边距和间距是**算过**的：三个按钮加上它们要塞进窗口最窄的 320
+        # （见 SUGGESTS 上面那段和 case_suggest_buttons）。别顺手加大。
+        row.setContentsMargins(14, 8, 14, 8)
         row.setSpacing(6)
+        # 两边都留弹簧 = 这一行居中。只留右边那个的话三个按钮齐刷刷靠左，
+        # 右边空出一大片，而下面的输入框和上面的气泡都是通栏的 —— 看着像漏排了。
+        # 居中不改变宽度之和，所以 case_suggest_buttons 的「塞得进 320」照样成立。
+        row.addStretch(1)
         for text in SUGGESTS:
             b = QPushButton(text)
             b.setObjectName("suggestBtn")
@@ -440,8 +582,28 @@ class ChatWindow(QWidget):
         self._stick = self._at_bottom()
 
     def _add(self, widget) -> None:
+        self._uncenter_notice()
         # 插在弹簧前面，否则新消息会跑到下面去
         self.msgs.insertWidget(self.msgs.count() - 1, widget)
+
+    def _uncenter_notice(self) -> None:
+        r"""把「顶到中间」的欢迎语打回原形。
+
+        `_center_notice` 让那条提示吸走全部剩余空间。真消息一来就得还原 ——
+        不还原的话它会一直撑着，消息全被挤到窗口底下，而且末尾那根弹簧也失效了。
+        以「竖直方向 Expanding」认人：消息区里只有欢迎语会被设成那样（气泡是
+        Maximum、提示是 Preferred），不用另存一个引用。
+        """
+        for i in range(self.msgs.count()):
+            it = self.msgs.itemAt(i)
+            w = it.widget() if it is not None else None
+            if w is not None and w.sizePolicy().verticalPolicy() == QSizePolicy.Expanding:
+                w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        last = self.msgs.count() - 1
+        sp = self.msgs.itemAt(last).spacerItem() if last >= 0 else None
+        if sp is not None:
+            sp.changeSize(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)
+            self.msgs.setStretch(last, 1)
 
     def _limit_w(self) -> int:
         """一条气泡 / 一行轨迹能占多宽。窗口可以缩放，写死像素必然错。"""
@@ -507,14 +669,18 @@ class ChatWindow(QWidget):
             self._append_day(lab)
 
     def _append_day(self, text: str) -> None:
-        lab = QLabel(text)
+        lab = _Day(text)
         # 打个标记。日期分隔线是消息区里**第三类**顶层控件（气泡、系统提示之外的），
         # 测试里数「行数/气泡数」的地方按老口径数的是前两类，没这个标记就得靠
         # 「今天」这两个字去认，改文案就崩。
         lab.setObjectName(DAY_OBJECT)
         lab.setAlignment(Qt.AlignCenter)
-        lab.setStyleSheet(f"color: {DIM.name()}; font-family: 'Microsoft YaHei UI';"
-                          " font-size: 8.5pt; padding: 8px 0 2px 0;")
+        # 上下那点留白用 setContentsMargins 而不是 QSS 的 padding：胶囊是按
+        # contentsRect 画的（见 _Day.paintEvent），QSS 的 padding 不进 contentsRect。
+        lab.setContentsMargins(0, 10, 0, 2)
+        lab.setStyleSheet(f"color: {DIM.name()};"
+                          " font-family: 'Microsoft YaHei UI'; font-size: 8.5pt;"
+                          " background: transparent;")
         self._add(lab)
 
     def _append_widget(self, text: str, mine: bool, ts: str = ""):
@@ -536,7 +702,7 @@ class ChatWindow(QWidget):
             row.addStretch(1)
             row.addWidget(bubble)
         else:
-            avatar = QLabel()
+            avatar = _Avatar()
             avatar.setStyleSheet("background: transparent;")
             pm = _avatar_pixmap()
             if not pm.isNull():
@@ -583,9 +749,13 @@ class ChatWindow(QWidget):
         # 左边一条竖线，是「这是旁白不是她说的话」最省事的画法。
         # 内缩 PAD_X + TAIL_W 让竖线正好落在气泡**正文**的左边缘上 —— 不缩的话
         # 它会从窗口最左边起，看着像另一条消息而不是这条气泡的注脚（画出来对过）。
+        #
+        # 8pt + DIM：旁白得**明显**小于正文（正文 10pt），小半档的话它读起来还是
+        # 「她说的另一句话」。线也换成了淡玫瑰，原来的 BORDER 在奶油底上是一条
+        # 实打实的粉杠，比它标注的那行字还显眼。
         lab.setStyleSheet(
-            f"color: {DIM.name()}; font-family: 'Microsoft YaHei UI'; font-size: 8.5pt;"
-            f" border-left: 2px solid {BORDER.name()}; padding-left: 8px;")
+            f"color: {DIM.name()}; font-family: 'Microsoft YaHei UI'; font-size: 8pt;"
+            f" border-left: 2px solid {theme.RULE.name()}; padding-left: 9px;")
         lab.setContentsMargins(PAD_X + TAIL_W, 0, 0, 0)
         lab.setMaximumWidth(self._limit_w())
         bubble._col.addWidget(lab)
@@ -597,8 +767,28 @@ class ChatWindow(QWidget):
         lab.setAlignment(Qt.AlignCenter)
         lab.setWordWrap(True)
         lab.setStyleSheet(f"color: {DIM.name()}; font-family: 'Microsoft YaHei UI';"
-                          " font-size: 9.5pt; padding: 6px;")
+                          " font-size: 9.5pt; padding: 6px 10px;"
+                          " background: transparent;")
         self._add(lab)
+        # 一句都没聊过的时候（消息区里只有这一条），把它顶到竖直中间。不然整块留白
+        # 全堆在下半屏，开窗那一下看着像界面还没加载完 —— 这是用户见到桌宠的第一眼。
+        if self.msgs.count() <= 2:      # 这一条 + 末尾那根弹簧
+            self._center_notice(lab)
+
+    def _center_notice(self, lab) -> None:
+        r"""把消息区里唯一的那条提示顶到竖直中间。
+
+        **不往布局里塞前置弹簧**：`msgs` 的项数是测试盯着的契约
+        （case_clear_history：「消息区就是弹簧 + 一句提示」== 2 项），多一根就红。
+        改成让这条提示自己吃下全部剩余空间（Expanding），末尾那根弹簧同时降级成
+        Minimum —— 空间只有它一个人要，字就落在正中间，项数一项没多。
+        """
+        lab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        last = self.msgs.count() - 1
+        sp = self.msgs.itemAt(last).spacerItem()
+        if sp is not None:
+            sp.changeSize(0, 0, QSizePolicy.Minimum, QSizePolicy.Minimum)
+            self.msgs.setStretch(last, 0)
 
     # ---------- 发送 ----------
     def send(self) -> None:
